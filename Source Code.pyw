@@ -410,6 +410,9 @@ class Vic3Logic:
 
         # 2. If not found, create new file
         if not target_file:
+            # Check if name is known for cleaner filename
+            # But prompt says: "find the file named 'tur - ottoman empire.txt' ... If the tag doesnt have a file ... simply create one"
+            # We will name it "tag.txt" or try to find name
             target_file = os.path.join(pop_dir, f"{clean_tag}.txt")
             target_content = f"POPULATION = {{\n\tc:{clean_tag} ?= {{\n\t}}\n}}"
             if os.path.exists(target_file):
@@ -978,6 +981,9 @@ class Vic3Logic:
             # User example: s:STATE_WEST_PRUSSIA={ ... }
 
             # Need to match strictly s:STATE_NAME\s*=\s*\{
+            # We will use re.search to find start, then block helper
+            # Standardize state name input (usually STATE_NAME) to regex
+            # state_list passed here are from transfer list, usually formatted cleanly
 
             # Regex: s:STATE_NAME\s*=\s*\{
             pattern = re.compile(r"s:" + re.escape(state) + r"\s*=\s*\{")
@@ -1029,6 +1035,8 @@ class Vic3Logic:
             # Check for railway tech
             # Match "add_technology_researched = railways" or "add_technology = railways"
             if "railways" not in target_content:
+                 # More precise check?
+                 # Just append to country block
                  s, e = self.get_block_range_safe(target_content, f"c:{clean_tag}")
                  if s is not None:
                      block = target_content[s:e]
@@ -1185,7 +1193,7 @@ class Vic3Logic:
                 cursor = abs_start + 1
 
         merged = {}
-       
+        # Dicts preserve insertion order (Python 3.7+)
 
         for b in blocks:
             # Key tuple: type, country, region, company
@@ -1487,7 +1495,7 @@ class Vic3Logic:
              owners.update(matches)
         return list(owners)
 
-    def transfer_ownership_batch(self, state_list, old_tag, new_tag):
+    def transfer_ownership_batch(self, state_list, old_owners, new_tag):
         # Auto-backup handled by caller or usually this is part of a larger operation like Create Country
         # If used standalone via "Transfer States", we should backup.
         self.perform_auto_backup()
@@ -1514,8 +1522,11 @@ class Vic3Logic:
                             block_content = content[s_start:s_end]
 
                             owners_to_process = []
-                            if old_tag:
-                                owners_to_process = [old_tag]
+                            if old_owners:
+                                if isinstance(old_owners, list):
+                                    owners_to_process = old_owners
+                                else:
+                                    owners_to_process = [old_owners]
                             else:
                                 detected = self._detect_owners(block_content, folder)
                                 owners_to_process = [o for o in detected if o.upper() != new_tag.upper()]
@@ -1970,8 +1981,11 @@ class Vic3Logic:
             target_owners = list(owners_found)
 
         # 1. Transfer Ownership
-        # Passing None as old_tag allows logic to detect per-file, which is safer if multiple old owners involved
-        _, railway_recipients = self.transfer_ownership_batch(states_clean, None, new_tag)
+        # If known_old_owners is provided (Targeted Transfer), we restrict to those.
+        # Otherwise (None), we let transfer_ownership_batch detect owners per-block (Auto Transfer).
+        owners_to_pass = known_old_owners if known_old_owners else None
+        
+        _, railway_recipients = self.transfer_ownership_batch(states_clean, owners_to_pass, new_tag)
 
         # 1b. Ensure Railway Tech for recipients
         for r_tag in railway_recipients:
@@ -2541,9 +2555,15 @@ class Vic3Logic:
                         if block_changed:
                             # Reconstruct the country block
                             new_block_body = "".join(new_body_parts)
-     
+                            # Replace in content (careful with indices, content hasn't changed length yet in loop but we are rebuilding)
+                            # To handle this safely in a loop, we usually do one pass or complex offset tracking.
+                            # Simpler: If changed, update 'content' and restart loop or adjust offsets?
+                            # Since we are iterating top-level blocks, replacing 'content' invalidates 'idx'.
 
-                            # Splice it in now
+                            # Strategy: Reconstruct the whole file content after processing all blocks?
+                            # Or just update this block and update 'e'.
+
+                            # Let's splice it in now
                             prefix = content[:s]
                             suffix = content[e:]
                             content = prefix + new_block_body + suffix
@@ -2699,6 +2719,11 @@ class Vic3Logic:
             block = content[s:e]
 
             # Regex to match the specific pact
+            # Need to match { ... country = c:TARGET ... type = TYPE } across lines
+            # This is hard with regex alone.
+
+            # Simple approach: Find block start, verify content, remove.
+            # Using block finder again inside.
 
             new_inner_parts = []
             cursor = 0
@@ -2955,7 +2980,7 @@ class Vic3Logic:
 
         try:
             # We want to replace contents. efficient way: rmtree then copytree
-            # Or copytree with dirs_exist_ok=True 
+            # Or copytree with dirs_exist_ok=True (Python 3.8+)
             if os.path.exists(backup_path):
                 shutil.rmtree(backup_path)
 
@@ -6747,7 +6772,7 @@ class StateManager:
         # 1. Remove from Loser (if it has a loser)
         was_impassable = False
         share = 0
-        
+
         # Capture port status before displacement modifies it
         was_loser_port = False
         loser_naval_exit = None
@@ -10959,7 +10984,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                 g = (packed_rgb >> 8) & 0xFF
                 b = packed_rgb & 0xFF
 
-                hex_code = "x{:02X}{:02X}{:02X}".format(r, g, b)
+                hex_code = "x{:02x}{:02x}{:02x}".format(r, g, b)
 
                 owner = self.province_owner_map.get(hex_code)
                 target_col = default_color
@@ -11133,7 +11158,9 @@ class Vic3ProvincePainter(tk.Toplevel):
                 state_list = list(states)
 
                 # Perform transfer and military logic using the centralized method
-                # We know the old owner here, but perform_transfer_sequence can verify abandonment
+                # We know the old owner here (from the clicked province), so we pass it to restrict transfer
+                # to just that owner's part of the state, preserving split states.
+                # perform_transfer_sequence can also verify abandonment.
                 # prune_refs=False because we do it once at the end
                 self.logic.perform_transfer_sequence(state_list, new, known_old_owners=[old], prune_refs=False)
 
@@ -11399,13 +11426,15 @@ class Vic3ProvincePainter(tk.Toplevel):
             for tag in found_owners:
                 owner_data[tag] = []
 
- 
+            # Handle unowned provinces (implicitly assigned to majority or need prompt? Assume 'unknown' or skipped?)
+            # Or just assign them to the owner of the majority?
             # We iterate selected provinces
             for p in self.selected_provinces:
                 curr = moving_provinces.get(p)
                 if curr:
                     owner_data[curr].append(p)
                 else:
+                     # Unowned? Assign to first or ignore?
                      # Let's assign to first found owner to avoid data loss
                      if found_owners:
                          first = list(found_owners)[0]
