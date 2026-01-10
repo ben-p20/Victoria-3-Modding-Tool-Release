@@ -665,15 +665,9 @@ class Vic3Logic:
         flag_dir = os.path.join(self.mod_path, "common/coat_of_arms/coat_of_arms")
         os.makedirs(flag_dir, exist_ok=True)
         flag_file = os.path.join(flag_dir, f"99_auto_{tag.lower()}.txt")
-        emblem_texture = "ce_crown.dds" if gov_type == "monarchy" else "ce_star.dds"
         flag_content = f"""{tag} = {{
     pattern = "pattern_solid.tga"
     color1 = "{flag_color_name}"
-    colored_emblem = {{
-        texture = "{emblem_texture}"
-        color1 = "gold"
-        instance = {{ position = {{ 0.5 0.5 }} scale = {{ 0.5 0.5 }} }}
-    }}
 }}
 """
         with open(flag_file, 'w', encoding='utf-8-sig') as f: f.write(flag_content)
@@ -934,7 +928,8 @@ class Vic3Logic:
 
     def get_block_range_safe(self, content, start_pattern, start_search_idx=0):
         # Updated regex to handle optional comments/whitespace between assignment and block start
-        pattern = re.compile(re.escape(start_pattern) + r"\s*(=|[\?]=)(?:(?:\s+)|(?:#[^\n]*\n))*\{", re.IGNORECASE)
+        # Now ensures start_pattern is preceded by boundary or whitespace to prevent partial matches
+        pattern = re.compile(r"(?:^|\s)" + re.escape(start_pattern) + r"\s*(=|[\?]=)(?:(?:\s+)|(?:#[^\n]*\n))*\{", re.IGNORECASE)
         match = pattern.search(content, start_search_idx)
         if not match: return None, None
         
@@ -1590,7 +1585,7 @@ class Vic3Logic:
                 c_start, c_end = self.get_block_range_safe(content, f"c:{old_tag}", current_search_idx)
                 found_tag = old_tag
             else:
-                pat = re.compile(r"c:([A-Za-z0-9_]+)\s*(\?=|:|=)?\s*\{")
+                pat = re.compile(r"(?:^|\s)c:([A-Za-z0-9_]+)\s*(\?=|:|=)?\s*\{")
                 m = pat.search(content, current_search_idx)
                 if m:
                     tag_start = current_search_idx + m.start()
@@ -1772,6 +1767,17 @@ class Vic3Logic:
         if not files_modified: return False
         new_file_content = "".join(processed_file_parts)
 
+        # Detect original wrapper existence using loose search to catch "MILITARY_FORMATIONS={"
+        has_wrapper_orig = bool(re.search(r"(?:^|\s)MILITARY_FORMATIONS\s*=", content))
+
+        # Check if wrapper was lost in reconstruction
+        has_wrapper_new = bool(re.search(r"(?:^|\s)MILITARY_FORMATIONS\s*=", new_file_content))
+
+        if has_wrapper_orig and not has_wrapper_new:
+            self.log("[FIX] Restoring missing MILITARY_FORMATIONS wrapper.")
+            # Wrap the whole content
+            new_file_content = f"MILITARY_FORMATIONS = {{\n{new_file_content}\n}}"
+
         def inject_new_formation(file_content, unit_buffer, f_type):
             if not unit_buffer: return file_content
             # Use dest_hq_region if provided, else use original region (which may be invalid if country left it)
@@ -1830,6 +1836,244 @@ class Vic3Logic:
         with open(filepath, 'w', encoding='utf-8-sig') as f: f.write(new_file_content)
         return True
 
+    def scan_state_resources(self, state_name):
+        """Scans state region files for resource data."""
+        # 1. Locate file
+        paths = []
+        if self.mod_path:
+            paths.append(os.path.join(self.mod_path, "map/data/state_regions"))
+            paths.append(os.path.join(self.mod_path, "map_data/state_regions"))
+        if self.vanilla_path:
+            paths.append(os.path.join(self.vanilla_path, "game/map/data/state_regions"))
+            paths.append(os.path.join(self.vanilla_path, "game/map_data/state_regions"))
+
+        data = {
+            "arable_land": 0,
+            "capped": {},
+            "arable": [],
+            "discoverable": [] # List of dicts {type, amount}
+        }
+
+        # Normalize state name
+        if not state_name.startswith("STATE_"):
+            state_name = f"STATE_{state_name.upper()}"
+
+        found_content = None
+        for p in paths:
+            if not os.path.exists(p): continue
+            for root, _, files in os.walk(p):
+                for file in files:
+                    if not file.endswith(".txt"): continue
+                    try:
+                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig', errors='ignore') as f:
+                            content = f.read()
+
+                        # Look for STATE_NAME = {
+                        if re.search(r"(^|\s)" + re.escape(state_name) + r"\s*=\s*\{", content):
+                            found_content = content
+                            break
+                    except: pass
+                if found_content: break
+            if found_content: break
+
+        if found_content:
+            # Extract block
+            s, e = self.get_block_range_safe(found_content, state_name)
+            if s is not None:
+                block = found_content[s:e]
+
+                # Arable Land
+                alm = re.search(r"arable_land\s*=\s*(\d+)", block)
+                if alm: data["arable_land"] = int(alm.group(1))
+
+                # Capped Resources
+                crm = re.search(r"capped_resources\s*=\s*\{", block)
+                if crm:
+                    crs, cre = self.find_block_content(block, crm.end()-1)
+                    if crs:
+                        cr_block = block[crs+1:cre-1]
+                        # Parse lines: building_x = N
+                        for m in re.finditer(r"(building_[A-Za-z0-9_]+)\s*=\s*(\d+)", cr_block):
+                            data["capped"][m.group(1)] = int(m.group(2))
+
+                # Arable Resources
+                arm = re.search(r"arable_resources\s*=\s*\{", block)
+                if arm:
+                    ars, are = self.find_block_content(block, arm.end()-1)
+                    if ars:
+                        ar_block = block[ars+1:are-1]
+                        # Parse strings
+                        # "building_x" "building_y"
+                        items = re.findall(r'"(building_[A-Za-z0-9_]+)"', ar_block)
+                        # Also unquoted
+                        # Split by whitespace, check for building_ prefix
+                        tokens = ar_block.split()
+                        items_unq = [t.strip() for t in tokens if t.strip().startswith("building_") and '"' not in t]
+
+                        all_ar = set(items + items_unq)
+                        data["arable"] = sorted(list(all_ar))
+
+                # Discoverable Resources (resource = { ... })
+                # Iterate all resource blocks
+                cursor = 0
+                while True:
+                    rm = re.search(r"resource\s*=\s*\{", block[cursor:])
+                    if not rm: break
+                    rs, re_idx = self.find_block_content(block, cursor + rm.end()-1)
+                    if rs:
+                        r_inner = block[rs+1:re_idx-1]
+                        # type = "x", undiscovered_amount = N
+                        tm = re.search(r'type\s*=\s*"?([A-Za-z0-9_]+)"?', r_inner)
+                        am = re.search(r'undiscovered_amount\s*=\s*(\d+)', r_inner)
+                        if tm and am:
+                            data["discoverable"].append({
+                                "type": tm.group(1),
+                                "amount": int(am.group(1))
+                            })
+                        cursor = re_idx
+                    else:
+                        cursor += 1
+
+        return data
+
+    def save_state_resources(self, state_name, data):
+        self.perform_auto_backup()
+        # 1. Locate file (Mod > Vanilla copy)
+        # We need to write to Mod.
+        target_file = None
+        target_content = None
+
+        mod_states_dir = os.path.join(self.mod_path, "map_data", "state_regions")
+        if not os.path.exists(mod_states_dir):
+             mod_states_dir = os.path.join(self.mod_path, "map", "data", "state_regions")
+             if not os.path.exists(mod_states_dir):
+                 # Default to map_data/state_regions if neither exists
+                 mod_states_dir = os.path.join(self.mod_path, "map_data", "state_regions")
+                 os.makedirs(mod_states_dir, exist_ok=True)
+
+        if not state_name.startswith("STATE_"):
+            state_name = f"STATE_{state_name.upper()}"
+
+        # Check existing mod file
+        for root, _, files in os.walk(mod_states_dir):
+            for file in files:
+                if not file.endswith(".txt"): continue
+                path = os.path.join(root, file)
+                try:
+                    with open(path, 'r', encoding='utf-8-sig') as f: c = f.read()
+                    if re.search(r"(^|\s)" + re.escape(state_name) + r"\s*=\s*\{", c):
+                        target_file = path
+                        target_content = c
+                        break
+                except: pass
+            if target_file: break
+
+        # If not in mod, check vanilla and COPY
+        if not target_file and self.vanilla_path:
+            # Check both legacy and new structure
+            v_dirs = [
+                os.path.join(self.vanilla_path, "game", "map_data", "state_regions"),
+                os.path.join(self.vanilla_path, "game", "map", "data", "state_regions")
+            ]
+            for v_dir in v_dirs:
+                if not os.path.exists(v_dir): continue
+                for root, _, files in os.walk(v_dir):
+                    for file in files:
+                        if not file.endswith(".txt"): continue
+                        path = os.path.join(root, file)
+                        try:
+                            with open(path, 'r', encoding='utf-8-sig', errors='ignore') as f: c = f.read()
+                            if re.search(r"(^|\s)" + re.escape(state_name) + r"\s*=\s*\{", c):
+                                # Found it. Copy to mod.
+                                target_file = os.path.join(mod_states_dir, file)
+                                target_content = c
+                                with open(target_file, 'w', encoding='utf-8-sig') as f_out:
+                                    f_out.write(c)
+                                self.log(f"[RES] Copied {file} from vanilla to mod.", 'info')
+                                break
+                        except: pass
+                    if target_file: break
+                if target_file: break
+
+        if not target_file:
+            self.log(f"[ERROR] Could not find state definition for {state_name}", 'error')
+            return
+
+        # 2. Modify Content
+        # We need to replace/update blocks inside STATE_NAME = { ... }
+        s, e = self.get_block_range_safe(target_content, state_name)
+        if s is None: return
+
+        block = target_content[s:e]
+
+        # A. Arable Land
+        if "arable_land" in block:
+            block = re.sub(r"arable_land\s*=\s*\d+", f"arable_land = {data['arable_land']}", block)
+        else:
+            # Insert at beginning of block (after opening brace)
+            first_brace = block.find('{')
+            block = block[:first_brace+1] + f"\n\tarable_land = {data['arable_land']}" + block[first_brace+1:]
+
+        # B. Capped Resources
+        # Construct block
+        capped_lines = []
+        for k, v in data['capped'].items():
+            capped_lines.append(f"\t\t{k} = {v}")
+
+        capped_str = "capped_resources = {\n" + "\n".join(capped_lines) + "\n\t}"
+
+        if "capped_resources" in block:
+            # Replace existing block
+            # Use regex to find start, helper for end
+            cm = re.search(r"capped_resources\s*=\s*\{", block)
+            if cm:
+                cs, ce = self.find_block_content(block, cm.end()-1)
+                if cs:
+                    block = block[:cm.start()] + capped_str + block[ce:]
+        else:
+            # Append before closing brace
+            last_brace = block.rfind('}')
+            block = block[:last_brace] + "\n\t" + capped_str + "\n" + block[last_brace:]
+
+        # C. Arable Resources
+        arable_lines = [f'"{x}"' for x in data['arable']]
+        arable_str = "arable_resources = { " + " ".join(arable_lines) + " }"
+
+        if "arable_resources" in block:
+            am = re.search(r"arable_resources\s*=\s*\{", block)
+            if am:
+                as_, ae = self.find_block_content(block, am.end()-1)
+                if as_:
+                    block = block[:am.start()] + arable_str + block[ae:]
+        else:
+            last_brace = block.rfind('}')
+            block = block[:last_brace] + "\n\t" + arable_str + "\n" + block[last_brace:]
+
+        # D. Discoverable Resources
+        # First, remove ALL existing resource blocks
+        # We'll use a loop to strip them out
+        while True:
+            rm = re.search(r"resource\s*=\s*\{", block)
+            if not rm: break
+            rs, re_idx = self.find_block_content(block, rm.end()-1)
+            if rs:
+                block = block[:rm.start()] + block[re_idx:]
+            else: break # Should not happen
+
+        # Now append new ones
+        res_strings = []
+        for item in data['discoverable']:
+            res_strings.append(f'\tresource = {{\n\t\ttype = "{item["type"]}"\n\t\tundiscovered_amount = {item["amount"]}\n\t}}')
+
+        if res_strings:
+            last_brace = block.rfind('}')
+            block = block[:last_brace] + "\n" + "\n".join(res_strings) + "\n" + block[last_brace:]
+
+        # Write back
+        final_content = target_content[:s] + block + target_content[e:]
+        with open(target_file, 'w', encoding='utf-8-sig') as f: f.write(final_content)
+        self.log(f"[RES] Updated resources for {state_name}", 'success')
+
     def clean_military_smart(self, old_tag, new_tag, region, state_list, force_move=False, dest_hq_region=None, dest_home_state=None):
         # Auto-backup usually done before this in transfer flow
         if not region and not state_list: return
@@ -1879,7 +2123,7 @@ class Vic3Logic:
                 new_content = content
                 cursor = 0
                 while True:
-                    m = re.search(r"create_military_formation\s*=\s*\{", new_content[cursor:])
+                    m = re.search(r"(?:^|\s)create_military_formation\s*=\s*\{", new_content[cursor:])
                     if not m: break
 
                     abs_start = cursor + m.start()
@@ -1984,7 +2228,7 @@ class Vic3Logic:
         # If known_old_owners is provided (Targeted Transfer), we restrict to those.
         # Otherwise (None), we let transfer_ownership_batch detect owners per-block (Auto Transfer).
         owners_to_pass = known_old_owners if known_old_owners else None
-        
+
         _, railway_recipients = self.transfer_ownership_batch(states_clean, owners_to_pass, new_tag)
 
         # 1b. Ensure Railway Tech for recipients
@@ -2206,6 +2450,10 @@ class Vic3Logic:
                          new_block = re.sub(r"religion\s*=\s*[A-Za-z0-9_]+", f"religion = {religion}", new_block)
                     else:
                          new_block = new_block[:new_block.rfind('}')] + f"\n\treligion = {religion}\n}}"
+
+                # Fix Bug: is_named_from_capital should be yes, not a state name
+                if re.search(r"is_named_from_capital\s*=\s*(?!yes\b)[A-Za-z0-9_]+", new_block):
+                    new_block = re.sub(r"is_named_from_capital\s*=\s*(?!yes\b)[A-Za-z0-9_]+", "is_named_from_capital = yes", new_block)
 
                 content = content[:start] + new_block + content[end:]
                 with open(filepath, 'w', encoding='utf-8-sig') as f: f.write(content)
@@ -2904,7 +3152,8 @@ class Vic3Logic:
             ("common/laws", True),
             ("common/technology/technologies", True),
             ("common/buildings", True),
-            ("map_data", True)
+            ("map_data", True),
+            ("gfx/map/map_object_data", True)
         ]
 
         copied_count = 0
@@ -6842,9 +7091,41 @@ class StateManager:
                 winner.hubs["port"] = province_hex
                 if loser_naval_exit:
                     winner.naval_exit_id = loser_naval_exit
+        elif winner.naval_exit_id and not winner.hubs["port"]:
+            # If target has a naval exit but NO port, and we just added a province,
+            # we should assign a port to prevent validation errors (state has coast but no port hub).
+            # This assumes the naval exit implies coastal access.
+            winner.hubs["port"] = province_hex
 
         self.province_owner_map[province_hex] = target_state_id
         return True
+
+    def delete_state_history_entries(self, state_id):
+        """Removes all references to the state from states, pops, and buildings history files."""
+        dirs = ["states", "pops", "buildings"]
+
+        for folder in dirs:
+            hist_dir = os.path.join(self.logic.mod_path, "common", "history", folder)
+            if not os.path.exists(hist_dir): continue
+
+            for root, _, files in os.walk(hist_dir):
+                for file in files:
+                    if not file.endswith(".txt"): continue
+                    fpath = os.path.join(root, file)
+
+                    try:
+                        with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
+                    except:
+                        with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
+
+                    # Find s:STATE_ID = { ... }
+                    s_start, s_end = self.logic.get_block_range_safe(content, f"s:{state_id}")
+
+                    if s_start is not None:
+                        # Remove the block
+                        new_content = content[:s_start] + content[s_end:]
+                        with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(new_content)
+                        self.logic.log(f"[CLEANUP] Removed {state_id} from history/{folder}/{file}")
 
     def create_new_state(self, state_name_key, owner_data, province_list):
         state_id = self.logic.normalize_state_key(state_name_key)
@@ -6852,7 +7133,7 @@ class StateManager:
         if state_id not in self.states:
             sobj = StateObject(state_id)
             # Default file path to mod/map_data/state_regions/99_custom_regions.txt
-            sobj.file_path = os.path.join(self.logic.mod_path, "map_data", "state_regions", "99_custom_states.txt")
+            sobj.file_path = os.path.join(self.logic.mod_path, "map_data", "state_regions", "99_custom_regions.txt")
             self.states[state_id] = sobj
             self.logic.log(f"Created new StateObject: {state_id}")
 
@@ -6928,7 +7209,8 @@ class StateManager:
             for f in files:
                 if f.endswith(".txt"):
                     with open(os.path.join(root, f), 'r', encoding='utf-8', errors='ignore') as fh:
-                        if f"s:{state_id}" in fh.read():
+                        # Use regex to avoid partial matches (e.g. s:STATE_1 inside s:STATE_10)
+                        if re.search(r"s:" + re.escape(state_id) + r"\s*(=|\?=)\s*\{", fh.read()):
                             found_hist = True
                             break
             if found_hist: break
@@ -6945,7 +7227,8 @@ class StateManager:
             else:
                 # Append if not present in file, otherwise rely on update
                 with open(new_hist_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                if f"s:{state_id}" not in content:
+                # Use regex to avoid partial matches
+                if not re.search(r"s:" + re.escape(state_id) + r"\s*(=|\?=)\s*\{", content):
                     idx = content.rfind('}')
                     if idx != -1:
                         new_content = content[:idx] + f"\n\ts:{state_id} = {{\n\t}}\n" + content[idx:]
@@ -7204,24 +7487,70 @@ class StateManager:
                                         current_provs.update(to_add)
 
                                     if len(current_provs) != original_len or (to_add & current_provs):
-                                        new_prov_str = " ".join([f'"{p.lower()}"' for p in sorted(list(current_provs))])
-                                        new_cs_body = cs_body[:op_s+1] + " " + new_prov_str + " " + cs_body[op_e-1:]
-                                        new_block_parts.append(f"create_state = {{{new_cs_body}}}")
-                                        block_modified = True
+                                        if not current_provs:
+                                            # Bug 4: Remove empty ownership block
+                                            block_modified = True
+                                            # Do not append anything to new_block_parts
+                                        else:
+                                            new_prov_str = " ".join([f'"{p.lower()}"' for p in sorted(list(current_provs))])
+                                            new_cs_body = cs_body[:op_s+1] + " " + new_prov_str + " " + cs_body[op_e-1:]
+                                            new_block_parts.append(f"create_state = {{{new_cs_body}}}")
+                                            block_modified = True
                                     else:
                                         new_block_parts.append(cs_inner_full)
                                 else:
                                     new_block_parts.append(cs_inner_full)
                             else:
                                 # Implicit ownership block.
-                                # If we are REMOVING from implicit, we must make it explicit (all provs minus removed).
-                                # But we don't know "all provs" easily without map data.
-                                # Assuming logic handled geometry update, update_history usually just handles explicit lists.
-                                # However, if we need to ADD to a specific owner who has implicit ownership...
-                                # If it's implicit, it means "everything else". Adding to it works by just updating geometry elsewhere?
-                                # But if we are adding explicit provinces to THIS state, and it was implicit...
-                                # It's safer to just append the create_state block if we need to enforce ownership.
-                                new_block_parts.append(cs_inner_full)
+                                # If we are REMOVING from implicit OR if we are adding explicit blocks for OTHER owners,
+                                # we must convert this implicit block to explicit to prevent duplicate ownership.
+                                should_convert = False
+
+                                # Case 1: Direct removal
+                                if removed_set:
+                                    should_convert = True
+
+                                # Case 2: New explicit blocks for others will be added (added_map has entries for others)
+                                # We need to check if any other owner is getting provinces in this state
+                                if not should_convert:
+                                    for k in added_map:
+                                        if k != "__ANY__" and k.upper().replace("C:", "") != clean_tag:
+                                            should_convert = True
+                                            break
+
+                                if should_convert and state_id in self.states:
+                                    # Convert to explicit
+                                    all_provs = {p.lower() for p in self.states[state_id].provinces}
+
+                                    # Determine what "others" own to subtract from "all"
+                                    # "others" includes:
+                                    # 1. removed_set (provinces leaving this owner)
+                                    # 2. provinces explicitly given to others in added_map
+
+                                    provinces_claimed_by_others = set(removed_set)
+
+                                    for k, v in added_map.items():
+                                        if k != "__ANY__" and k.upper().replace("C:", "") != clean_tag:
+                                            provinces_claimed_by_others.update({p.lower() for p in v})
+
+                                    current_provs = all_provs - provinces_claimed_by_others
+
+                                    # If we are also adding to THIS owner, ensure they are included
+                                    if to_add:
+                                        current_provs.update(to_add)
+
+                                    if not current_provs:
+                                        # Empty after conversion -> remove block
+                                        block_modified = True
+                                    else:
+                                        new_prov_str = " ".join([f'"{p.lower()}"' for p in sorted(list(current_provs))])
+                                        # Construct new explicit body
+                                        # Inject owned_provinces before closing brace
+                                        new_cs_body = cs_body.rstrip() + f"\n\t\towned_provinces = {{ {new_prov_str} }}\n"
+                                        new_block_parts.append(f"create_state = {{{new_cs_body}}}")
+                                        block_modified = True
+                                else:
+                                    new_block_parts.append(cs_inner_full)
 
                             inner_cursor = cs_e
                             last_inner_idx = cs_e
@@ -7278,7 +7607,7 @@ class StateManager:
         # Determine target file
         target_path = sobj.file_path
         if not target_path or (self.logic.vanilla_path and target_path.startswith(self.logic.vanilla_path)):
-            fname = os.path.basename(sobj.file_path) if sobj.file_path else f"99_custom_states.txt"
+            fname = os.path.basename(sobj.file_path) if sobj.file_path else f"99_custom_regions.txt"
             target_path = os.path.join(self.logic.mod_path, "map_data", "state_regions", fname)
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
@@ -7295,6 +7624,20 @@ class StateManager:
                 with open(target_path, 'r', encoding='utf-8') as f: content = f.read()
         else:
             content = ""
+
+        if not sobj.provinces:
+            # Bug 4: Remove definition if no provinces
+            if re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content):
+                m = re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content)
+                s, e = self.logic.find_block_content(content, m.end() - 1)
+                if s:
+                    content = content[:m.start()] + content[e:]
+                    with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
+                    self.logic.log(f"[MAP] Removed empty state {state_id} from {os.path.basename(target_path)}")
+
+                    # Clean up related history entries to prevent NULL_STATE errors
+                    self.delete_state_history_entries(state_id)
+            return
 
         prov_str = " ".join(f'"{p.lower()}"' for p in sobj.provinces)
         impass_str = " ".join(f'"{p.lower()}"' for p in sobj.impassable)
@@ -7363,6 +7706,152 @@ class StateManager:
 
         if sobj.naval_exit_id and not sobj.hubs['port']:
             self.logic.log(f"[WARN] State {state_id} has naval exit but no port hub.", 'warn')
+
+    def move_orphaned_region_state(self, old_state_id, tag, new_state_id):
+        """Moves entire region_state contents (Pops, Buildings) and Military Units from old to new state."""
+        self.logic.log(f"[CLEANUP] {tag} has no land left in {old_state_id}. Moving assets to {new_state_id}...")
+
+        # 1. POPS & BUILDINGS
+        folders = ["pops", "buildings"]
+        for folder in folders:
+            target_dir = os.path.join(self.logic.mod_path, "common/history", folder)
+            if not os.path.exists(target_dir): continue
+            
+            # Find file containing s:OLD_STATE
+            old_file_path = None
+            old_file_content = None
+            
+            for root, _, files in os.walk(target_dir):
+                for file in files:
+                    if not file.endswith(".txt"): continue
+                    path = os.path.join(root, file)
+                    try:
+                        with open(path, 'r', encoding='utf-8-sig') as f: c = f.read()
+                    except:
+                        with open(path, 'r', encoding='utf-8') as f: c = f.read()
+                    
+                    if re.search(r"s:" + re.escape(old_state_id) + r"\s*=\s*\{", c):
+                        old_file_path = path
+                        old_file_content = c
+                        break
+                if old_file_path: break
+            
+            if old_file_path and old_file_content:
+                s, e = self.logic.get_block_range_safe(old_file_content, f"s:{old_state_id}")
+                if s is not None:
+                    state_block = old_file_content[s:e]
+                    
+                    # Find region_state:TAG block inside
+                    rs_pat = re.compile(r"region_state:" + re.escape(tag) + r"\s*=\s*\{")
+                    m_rs = rs_pat.search(state_block)
+                    
+                    if m_rs:
+                        rs_s, rs_e = self.logic.find_block_content(state_block, m_rs.end() - 1)
+                        if rs_s:
+                            rs_full = state_block[m_rs.start():rs_e] 
+                            rs_body = state_block[rs_s+1:rs_e-1]
+                            
+                            # Remove from old file
+                            new_state_block = state_block[:m_rs.start()] + state_block[rs_e:]
+                            new_file_content = old_file_content[:s] + new_state_block + old_file_content[e:]
+                            with open(old_file_path, 'w', encoding='utf-8-sig') as f: f.write(new_file_content)
+                            
+                            # Add to new state file
+                            new_file_path = None
+                            new_file_content = None
+                            
+                            for root, _, files in os.walk(target_dir):
+                                for file in files:
+                                    if not file.endswith(".txt"): continue
+                                    path = os.path.join(root, file)
+                                    try:
+                                        with open(path, 'r', encoding='utf-8-sig') as f: c = f.read()
+                                    except:
+                                        with open(path, 'r', encoding='utf-8') as f: c = f.read()
+                                    
+                                    if re.search(r"s:" + re.escape(new_state_id) + r"\s*=\s*\{", c):
+                                        new_file_path = path
+                                        new_file_content = c
+                                        break
+                                if new_file_path: break
+                            
+                            if not new_file_path:
+                                new_file_path = os.path.join(target_dir, f"99_custom_{new_state_id}.txt")
+                                wrapper = "POPS" if folder == "pops" else "BUILDINGS"
+                                new_file_content = f"{wrapper} = {{\n\ts:{new_state_id} = {{\n\t}}\n}}"
+                                if os.path.exists(new_file_path):
+                                     with open(new_file_path, 'r', encoding='utf-8-sig') as f: new_file_content = f.read()
+                            
+                            ns, ne = self.logic.get_block_range_safe(new_file_content, f"s:{new_state_id}")
+                            if ns is not None:
+                                ns_block = new_file_content[ns:ne]
+                                nm_rs = rs_pat.search(ns_block)
+                                if nm_rs:
+                                    nrs_s, nrs_e = self.logic.find_block_content(ns_block, nm_rs.end()-1)
+                                    if nrs_s:
+                                        to_append = rs_body
+                                        if folder == "buildings":
+                                            to_append = re.sub(r'region\s*=\s*"(s:)?' + re.escape(old_state_id) + r'"', f'region = "{new_state_id}"', to_append)
+                                        
+                                        updated_ns_rs = ns_block[nm_rs.start():nrs_e-1] + "\n" + to_append + "\n\t\t}"
+                                        updated_ns_block = ns_block[:nm_rs.start()] + updated_ns_rs + ns_block[nrs_e:]
+                                        new_file_content = new_file_content[:ns] + updated_ns_block + new_file_content[ne:]
+                                else:
+                                    to_append = rs_full
+                                    if folder == "buildings":
+                                        to_append = re.sub(r'region\s*=\s*"(s:)?' + re.escape(old_state_id) + r'"', f'region = "{new_state_id}"', to_append)
+                                        
+                                    last_brace = ns_block.rfind('}')
+                                    updated_ns_block = ns_block[:last_brace] + "\n\t\t" + to_append + "\n\t}"
+                                    new_file_content = new_file_content[:ns] + updated_ns_block + new_file_content[ne:]
+                                
+                                with open(new_file_path, 'w', encoding='utf-8-sig') as f: f.write(new_file_content)
+                                self.logic.log(f"Moved orphaned {folder} for {tag} from {old_state_id} to {new_state_id}")
+
+        # 2. MILITARY
+        self._move_orphaned_military(old_state_id, tag, new_state_id)
+
+    def _move_orphaned_military(self, old_state, tag, new_state):
+        mil_dir = os.path.join(self.logic.mod_path, "common/history/military_formations")
+        if not os.path.exists(mil_dir): return
+        
+        old_clean = self.logic.normalize_state_key(old_state).replace("s:", "")
+        new_clean = self.logic.normalize_state_key(new_state).replace("s:", "")
+        clean_tag = tag.replace("c:", "")
+
+        for root, _, files in os.walk(mil_dir):
+            for file in files:
+                if not file.endswith(".txt"): continue
+                path = os.path.join(root, file)
+                try:
+                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
+                except:
+                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
+                
+                current_idx = 0
+                file_mod = False
+                new_content = content
+                
+                while True:
+                    c_start, c_end = self.logic.get_block_range_safe(new_content, f"c:{clean_tag}", current_idx)
+                    if c_start is None: break
+                    
+                    block = new_content[c_start:c_end]
+                    
+                    pat = re.compile(r"state_region\s*=\s*(?:s:)?\"?" + re.escape(old_clean) + r"\"?\b")
+                    
+                    if pat.search(block):
+                        new_block = pat.sub(f"state_region = s:{new_clean}", block)
+                        new_content = new_content[:c_start] + new_block + new_content[c_end:]
+                        file_mod = True
+                        diff = len(new_block) - len(block)
+                        current_idx = c_end + diff
+                    else:
+                        current_idx = c_end
+                
+                if file_mod:
+                    with open(path, 'w', encoding='utf-8-sig') as f: f.write(new_content)
+                    self.logic.log(f"Moved military units for {tag} from {old_clean} to {new_clean}")
 
 class App(tk.Tk):
     def __init__(self):
@@ -10067,7 +10556,89 @@ class App(tk.Tk):
         ttk.Button(b_ctrl, text="Remove", command=self.remove_state_building_ui).pack(fill=tk.X, pady=2)
         ttk.Button(b_ctrl, text="Update", command=self.update_state_building_level_ui).pack(fill=tk.X, pady=2)
 
-        # 3. Population
+        # 3. Resources (New Section)
+        r_frame = ttk.LabelFrame(f, text="Resources", padding=10)
+        r_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        # Arable Land at top
+        r_top = ttk.Frame(r_frame)
+        r_top.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(r_top, text="Arable Land:").pack(side=tk.LEFT)
+        self.sm_arable_land = tk.StringVar(value="0")
+        ttk.Entry(r_top, textvariable=self.sm_arable_land, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Button(r_top, text="Save Resources", command=self.save_state_resources_ui).pack(side=tk.RIGHT)
+
+        # Tabs for resource types
+        r_tabs = ttk.Notebook(r_frame)
+        r_tabs.pack(fill=tk.BOTH, expand=True)
+
+        tab_capped = ttk.Frame(r_tabs)
+        tab_arable = ttk.Frame(r_tabs)
+        tab_disc = ttk.Frame(r_tabs)
+
+        r_tabs.add(tab_capped, text="Capped (Mines/Forestry)")
+        r_tabs.add(tab_arable, text="Arable (Farms)")
+        r_tabs.add(tab_disc, text="Discoverable (Oil/Gold)")
+
+        # Lists for options
+        # Prompt lists:
+        self.RES_CAPPED_OPTS = sorted([
+            "building_iron_mine", "building_coal_mine", "building_lead_mine",
+            "building_sulfur_mine", "building_gold_mine", "building_logging_camp",
+            "building_fishing_wharf", "building_whaling_station"
+        ])
+        self.RES_ARABLE_OPTS = sorted([
+            "building_rye_farm", "building_wheat_farm", "building_rice_farm", "building_maize_farm", "building_millet_farm",
+            "building_livestock_ranch", "building_vineyard",
+            "building_cotton_plantation", "building_silk_plantation", "building_dye_plantation",
+            "building_opium_plantation", "building_tea_plantation", "building_coffee_plantation",
+            "building_tobacco_plantation", "building_sugar_plantation", "building_fruit_plantation",
+            "building_rubber_plantation"
+        ])
+        self.RES_DISC_OPTS = ["building_oil_rig", "building_gold_fields", "building_rubber_plantation"]
+
+        # -- Tab Capped --
+        self.tv_capped = ttk.Treeview(tab_capped, columns=("type", "amount"), show="headings", height=5)
+        self.tv_capped.heading("type", text="Resource"); self.tv_capped.column("type", width=200)
+        self.tv_capped.heading("amount", text="Amount"); self.tv_capped.column("amount", width=80)
+        self.tv_capped.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        c_ctrl = ttk.Frame(tab_capped)
+        c_ctrl.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+        self.sm_res_cap_type = tk.StringVar()
+        ttk.Combobox(c_ctrl, textvariable=self.sm_res_cap_type, values=self.RES_CAPPED_OPTS, width=25).pack(pady=2)
+        self.sm_res_cap_amt = tk.StringVar(value="10")
+        ttk.Entry(c_ctrl, textvariable=self.sm_res_cap_amt, width=10).pack(pady=2)
+        ttk.Button(c_ctrl, text="Add/Update", command=lambda: self.add_resource_ui("capped")).pack(fill=tk.X, pady=2)
+        ttk.Button(c_ctrl, text="Remove", command=lambda: self.remove_resource_ui("capped")).pack(fill=tk.X, pady=2)
+
+        # -- Tab Arable --
+        self.lb_arable = tk.Listbox(tab_arable, height=5)
+        self.lb_arable.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        a_ctrl = ttk.Frame(tab_arable)
+        a_ctrl.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+        self.sm_res_ara_type = tk.StringVar()
+        ttk.Combobox(a_ctrl, textvariable=self.sm_res_ara_type, values=self.RES_ARABLE_OPTS, width=25).pack(pady=2)
+        ttk.Button(a_ctrl, text="Add", command=lambda: self.add_resource_ui("arable")).pack(fill=tk.X, pady=2)
+        ttk.Button(a_ctrl, text="Remove", command=lambda: self.remove_resource_ui("arable")).pack(fill=tk.X, pady=2)
+
+        # -- Tab Discoverable --
+        self.tv_disc = ttk.Treeview(tab_disc, columns=("type", "amount"), show="headings", height=5)
+        self.tv_disc.heading("type", text="Resource"); self.tv_disc.column("type", width=200)
+        self.tv_disc.heading("amount", text="Undiscovered"); self.tv_disc.column("amount", width=100)
+        self.tv_disc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        d_ctrl = ttk.Frame(tab_disc)
+        d_ctrl.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+        self.sm_res_disc_type = tk.StringVar()
+        ttk.Combobox(d_ctrl, textvariable=self.sm_res_disc_type, values=self.RES_DISC_OPTS, width=25).pack(pady=2)
+        self.sm_res_disc_amt = tk.StringVar(value="20")
+        ttk.Entry(d_ctrl, textvariable=self.sm_res_disc_amt, width=10).pack(pady=2)
+        ttk.Button(d_ctrl, text="Add/Update", command=lambda: self.add_resource_ui("discoverable")).pack(fill=tk.X, pady=2)
+        ttk.Button(d_ctrl, text="Remove", command=lambda: self.remove_resource_ui("discoverable")).pack(fill=tk.X, pady=2)
+
+        # 4. Population
         p_frame = ttk.LabelFrame(f, text="Population", padding=10)
         p_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
@@ -10226,6 +10797,9 @@ class App(tk.Tk):
 
         # Refresh Mixer
         self.load_demographics_for_scope()
+
+        # Load Resources
+        self.load_state_resources_ui()
 
         self.log_message(f"Loaded data for {state}", 'success')
 
@@ -10446,6 +11020,128 @@ class App(tk.Tk):
         self.logic.set_country_total_pop(tag, new_tot)
         self.log_message(f"Updated total population for {tag}", 'success')
         messagebox.showinfo("Success", "Country population updated.")
+
+    # --- RESOURCE UI HANDLERS ---
+    def load_state_resources_ui(self):
+        state = self.sm_state_name.get().strip()
+        if not state: return
+
+        data = self.logic.scan_state_resources(state)
+        self.current_state_resources = data # Store for editing
+
+        # Populate Fields
+        self.sm_arable_land.set(str(data["arable_land"]))
+
+        # Capped
+        for i in self.tv_capped.get_children(): self.tv_capped.delete(i)
+        for k, v in data["capped"].items():
+            self.tv_capped.insert("", tk.END, values=(k, v))
+
+        # Arable
+        self.lb_arable.delete(0, tk.END)
+        for r in data["arable"]:
+            self.lb_arable.insert(tk.END, r)
+
+        # Discoverable
+        for i in self.tv_disc.get_children(): self.tv_disc.delete(i)
+        for d in data["discoverable"]:
+            self.tv_disc.insert("", tk.END, values=(d["type"], d["amount"]))
+
+    def add_resource_ui(self, r_type):
+        if not hasattr(self, 'current_state_resources'): return
+
+        if r_type == "capped":
+            t = self.sm_res_cap_type.get().strip()
+            try:
+                amt = int(self.sm_res_cap_amt.get())
+            except: return messagebox.showerror("Error", "Amount must be integer.")
+
+            if t:
+                # If adding manually typed one, ensure prefix?
+                if not t.startswith("building_"): t = f"building_{t}"
+                self.current_state_resources["capped"][t] = amt
+                # Refresh UI
+                for i in self.tv_capped.get_children(): self.tv_capped.delete(i)
+                for k, v in self.current_state_resources["capped"].items():
+                    self.tv_capped.insert("", tk.END, values=(k, v))
+
+        elif r_type == "arable":
+            t = self.sm_res_ara_type.get().strip()
+            if t:
+                if not t.startswith("building_"): t = f"building_{t}"
+                if t not in self.current_state_resources["arable"]:
+                    self.current_state_resources["arable"].append(t)
+                    self.current_state_resources["arable"].sort()
+                    # Refresh UI
+                    self.lb_arable.delete(0, tk.END)
+                    for r in self.current_state_resources["arable"]:
+                        self.lb_arable.insert(tk.END, r)
+
+        elif r_type == "discoverable":
+            t = self.sm_res_disc_type.get().strip()
+            try:
+                amt = int(self.sm_res_disc_amt.get())
+            except: return messagebox.showerror("Error", "Amount must be integer.")
+
+            if t:
+                if not t.startswith("building_"): t = f"building_{t}"
+                # Update existing or add new
+                found = False
+                for item in self.current_state_resources["discoverable"]:
+                    if item["type"] == t:
+                        item["amount"] = amt
+                        found = True
+                        break
+                if not found:
+                    self.current_state_resources["discoverable"].append({"type": t, "amount": amt})
+
+                # Refresh UI
+                for i in self.tv_disc.get_children(): self.tv_disc.delete(i)
+                for d in self.current_state_resources["discoverable"]:
+                    self.tv_disc.insert("", tk.END, values=(d["type"], d["amount"]))
+
+    def remove_resource_ui(self, r_type):
+        if not hasattr(self, 'current_state_resources'): return
+
+        if r_type == "capped":
+            sel = self.tv_capped.selection()
+            if sel:
+                item = self.tv_capped.item(sel[0])
+                key = item['values'][0]
+                if key in self.current_state_resources["capped"]:
+                    del self.current_state_resources["capped"][key]
+                    self.tv_capped.delete(sel[0])
+
+        elif r_type == "arable":
+            sel = self.lb_arable.curselection()
+            if sel:
+                val = self.lb_arable.get(sel[0])
+                if val in self.current_state_resources["arable"]:
+                    self.current_state_resources["arable"].remove(val)
+                    self.lb_arable.delete(sel[0])
+
+        elif r_type == "discoverable":
+            sel = self.tv_disc.selection()
+            if sel:
+                item = self.tv_disc.item(sel[0])
+                key = item['values'][0]
+                # Filter list
+                self.current_state_resources["discoverable"] = [d for d in self.current_state_resources["discoverable"] if d["type"] != key]
+                self.tv_disc.delete(sel[0])
+
+    def save_state_resources_ui(self):
+        state = self.sm_state_name.get().strip()
+        if not state: return messagebox.showerror("Error", "Load a state first.")
+
+        if not hasattr(self, 'current_state_resources'): return
+
+        try:
+            al = int(self.sm_arable_land.get())
+            self.current_state_resources["arable_land"] = al
+        except: return messagebox.showerror("Error", "Arable Land must be integer.")
+
+        self.logic.save_state_resources(state, self.current_state_resources)
+        messagebox.showinfo("Success", "Resources updated.")
 
 # =============================================================================
 #  VISUAL MAP PAINTER
@@ -11379,6 +12075,31 @@ class Vic3ProvincePainter(tk.Toplevel):
             # Apply History Changes
             for state_id, changes in history_changes.items():
                 self.logic.state_manager.update_history_provinces(state_id, changes["added"], changes["removed"])
+
+            # Check for orphaned region_states in split states
+            for old_state_id in affected_states:
+                if old_state_id == self.custom_target_state: continue
+
+                # Identify tags that lost land in this state
+                lost_tags = set()
+                if old_state_id in history_changes:
+                    for p in history_changes[old_state_id]["removed"]:
+                        owner = moving_provinces.get(p)
+                        if owner: lost_tags.add(owner)
+
+                # Check if they remain in the state
+                if old_state_id in self.logic.state_manager.states:
+                    remaining_provinces = self.logic.state_manager.states[old_state_id].provinces
+                    remaining_owners = set()
+                    for p in remaining_provinces:
+                        # Use current map owner (cache)
+                        # Note: cache is stale for moved provinces, but valid for non-moved ones
+                        o = self.province_owner_map.get(p)
+                        if o: remaining_owners.add(o)
+
+                    for tag in lost_tags:
+                        if tag not in remaining_owners:
+                            self.logic.state_manager.move_orphaned_region_state(old_state_id, tag, self.custom_target_state)
 
             self.selected_provinces.clear()
             self.reload_data()
