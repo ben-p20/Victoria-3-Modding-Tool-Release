@@ -18,6 +18,150 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
+
+def _resolve_popup_parent(explicit_parent=None):
+    candidates = []
+    if explicit_parent is not None:
+        candidates.append(explicit_parent)
+
+    root = getattr(tk, "_default_root", None)
+    if root is not None:
+        for getter in (root.grab_current, root.focus_get):
+            try:
+                candidate = getter()
+            except Exception:
+                candidate = None
+            if candidate is not None:
+                candidates.append(candidate)
+
+        try:
+            pointer_widget = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
+        except Exception:
+            pointer_widget = None
+        if pointer_widget is not None:
+            candidates.append(pointer_widget)
+
+        candidates.append(root)
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            window = candidate if isinstance(candidate, (tk.Tk, tk.Toplevel)) else candidate.winfo_toplevel()
+            if window is not None and window.winfo_exists():
+                return window
+        except Exception:
+            continue
+    return None
+
+
+def _restore_topmost(window, value):
+    try:
+        if window is not None and window.winfo_exists():
+            window.attributes("-topmost", value)
+    except Exception:
+        pass
+
+
+def _call_dialog_with_front_parent(func, *args, **kwargs):
+    parent = _resolve_popup_parent(kwargs.get("parent"))
+    if parent is not None:
+        kwargs["parent"] = parent
+
+    if parent is not None:
+        try:
+            parent.lift()
+            parent.focus_force()
+            parent.update_idletasks()
+        except Exception:
+            pass
+
+    return func(*args, **kwargs)
+
+
+def _patch_dialog_function(module, function_name):
+    original = getattr(module, function_name, None)
+    if not callable(original):
+        return
+
+    def wrapped(*args, _original=original, **kwargs):
+        return _call_dialog_with_front_parent(_original, *args, **kwargs)
+
+    setattr(module, function_name, wrapped)
+
+
+def _activate_popup_window(window, parent=None):
+    try:
+        if window is None or not window.winfo_exists():
+            return
+    except Exception:
+        return
+
+    try:
+        if parent is not None and parent.winfo_exists():
+            window.lift(parent)
+        else:
+            window.lift()
+    except Exception:
+        pass
+
+    try:
+        previous_topmost = bool(int(window.attributes("-topmost")))
+    except Exception:
+        previous_topmost = False
+
+    topmost_applied = False
+    try:
+        window.attributes("-topmost", True)
+        topmost_applied = True
+    except Exception:
+        pass
+
+    try:
+        window.focus_force()
+    except Exception:
+        pass
+
+    if topmost_applied:
+        try:
+            window.after(50, lambda w=window, value=previous_topmost: _restore_topmost(w, value))
+        except Exception:
+            pass
+
+
+_ORIGINAL_TOPLEVEL_INIT = tk.Toplevel.__init__
+
+
+def _patched_toplevel_init(self, master=None, cnf=None, **kw):
+    if cnf is None:
+        cnf = {}
+    _ORIGINAL_TOPLEVEL_INIT(self, master, cnf, **kw)
+    parent = _resolve_popup_parent(master)
+    try:
+        self.after_idle(lambda win=self, popup_parent=parent: _activate_popup_window(win, popup_parent))
+    except Exception:
+        pass
+
+
+tk.Toplevel.__init__ = _patched_toplevel_init
+
+for _dialog_func in [
+    "showinfo", "showwarning", "showerror", "askquestion", "askokcancel",
+    "askretrycancel", "askyesno", "askyesnocancel"
+]:
+    _patch_dialog_function(messagebox, _dialog_func)
+
+for _dialog_func in ["askstring", "askinteger", "askfloat"]:
+    _patch_dialog_function(simpledialog, _dialog_func)
+
+for _dialog_func in [
+    "askopenfilename", "askopenfilenames", "askopenfile", "askopenfiles",
+    "asksaveasfilename", "asksaveasfile", "askdirectory"
+]:
+    _patch_dialog_function(filedialog, _dialog_func)
+
+_patch_dialog_function(colorchooser, "askcolor")
+
 # =============================================================================
 #  CORE LOGIC
 # =============================================================================
@@ -39,8 +183,81 @@ class Vic3Logic:
         self.state_manager.load_state_regions()
 
     def set_vanilla_path(self, path):
-        self.vanilla_path = path
+        self.vanilla_path = self.normalize_vanilla_path(path)
         self.state_manager.load_state_regions()
+
+    def normalize_vanilla_path(self, path):
+        """Accept either the Victoria 3 root folder or the game subfolder and normalize to the root."""
+        if not path:
+            return ""
+
+        norm = os.path.normpath(path)
+        if os.path.basename(norm).lower() == "game":
+            parent = os.path.dirname(norm)
+            if os.path.isdir(os.path.join(norm, "common")) or os.path.isdir(os.path.join(norm, "map")) or os.path.isdir(os.path.join(norm, "map_data")):
+                return parent
+
+        return norm
+
+    def get_effective_vanilla_path(self):
+        """Returns a usable Victoria 3 install root, auto-detecting it when possible."""
+        normalized = self.normalize_vanilla_path(self.vanilla_path)
+        if normalized and os.path.exists(os.path.join(normalized, "game")):
+            self.vanilla_path = normalized
+            return normalized
+
+        detected = self.auto_detect_vanilla_path()
+        if detected:
+            self.vanilla_path = detected
+            return detected
+
+        return ""
+
+    def auto_detect_vanilla_path(self):
+        """Best-effort auto-detection of the Victoria 3 install root."""
+        candidates = []
+
+        # Common direct install locations.
+        for env_name in ("PROGRAMFILES(X86)", "PROGRAMFILES"):
+            base = os.environ.get(env_name)
+            if base:
+                steam_base = os.path.join(base, "Steam")
+                candidates.append(os.path.join(steam_base, "steamapps", "common", "Victoria 3"))
+
+        # Steam registry install path on Windows.
+        if os.name == "nt":
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+                    steam_path, _ = winreg.QueryValueEx(key, "SteamPath")
+                    if steam_path:
+                        candidates.append(os.path.join(steam_path, "steamapps", "common", "Victoria 3"))
+
+                        library_vdf = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
+                        if os.path.exists(library_vdf):
+                            try:
+                                with open(library_vdf, "r", encoding="utf-8", errors="ignore") as f:
+                                    vdf_content = f.read()
+                                for lib_path in re.findall(r'"path"\s+"([^"]+)"', vdf_content):
+                                    lib_path = lib_path.replace('\\\\', '\\')
+                                    candidates.append(os.path.join(lib_path, "steamapps", "common", "Victoria 3"))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # Return the first valid root we can confirm.
+        seen = set()
+        for candidate in candidates:
+            norm = self.normalize_vanilla_path(candidate)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+
+            if os.path.exists(os.path.join(norm, "game", "common", "country_definitions")):
+                return norm
+
+        return ""
 
     def safe_str(self, s):
         if not s: return ""
@@ -89,76 +306,166 @@ class Vic3Logic:
                     return True
         return False
 
+    def _parse_vic3_color_value(self, block):
+        """Parses a Vic3 color line from a block and returns (r, g, b) or None."""
+        c_match = re.search(
+            r"\bcolor\b\s*=\s*(hsv360|hsv|rgb)?\s*\{\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\}",
+            block,
+            re.IGNORECASE
+        )
+        if not c_match:
+            return None
+
+        c_type = (c_match.group(1) or "").lower()
+        v1 = float(c_match.group(2))
+        v2 = float(c_match.group(3))
+        v3 = float(c_match.group(4))
+
+        if c_type == "hsv360":
+            h = (v1 % 360.0) / 360.0
+            s = v2 / 100.0 if v2 > 1.0 else v2
+            v = v3 / 100.0 if v3 > 1.0 else v3
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+        if c_type == "hsv":
+            h = v1 if v1 <= 1.0 else (v1 % 360.0) / 360.0
+            s = v2 / 100.0 if v2 > 1.0 else v2
+            v = v3 / 100.0 if v3 > 1.0 else v3
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
+
+        # RGB can be stored either as 0-255 integers or 0-1 floats.
+        if all(0.0 <= val <= 1.0 for val in (v1, v2, v3)) and any(val > 0.0 for val in (v1, v2, v3)):
+            return (
+                int(round(v1 * 255)),
+                int(round(v2 * 255)),
+                int(round(v3 * 255))
+            )
+
+        return (int(round(v1)), int(round(v2)), int(round(v3)))
+
+    def find_country_color(self, tag):
+        """Finds the effective color for a specific tag, with mod files overriding vanilla."""
+        clean_tag = (tag or "").replace("c:", "").strip().upper()
+        if not clean_tag:
+            return None
+
+        effective_vanilla = self.get_effective_vanilla_path()
+
+        paths = []
+        if effective_vanilla:
+            paths.append(os.path.join(effective_vanilla, "game", "common", "country_definitions"))
+        if self.mod_path:
+            paths.append(os.path.join(self.mod_path, "common", "country_definitions"))
+
+        color = None
+        block_pattern = re.compile(
+            rf"(^|\s)(?:c:)?{re.escape(clean_tag)}\s*(?:\?=|=)\s*\{{",
+            re.MULTILINE | re.IGNORECASE
+        )
+
+        # Vanilla first, mod second, so later matches act as overrides.
+        for base_path in paths:
+            if not os.path.exists(base_path):
+                continue
+
+            for root, _, files in os.walk(base_path):
+                for file in files:
+                    if not file.endswith(".txt"):
+                        continue
+
+                    fpath = os.path.join(root, file)
+                    try:
+                        with open(fpath, "r", encoding="utf-8-sig") as f:
+                            content = f.read()
+                    except Exception:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+
+                    cursor = 0
+                    while True:
+                        m = block_pattern.search(content, cursor)
+                        if not m:
+                            break
+
+                        start_idx = m.end() - 1
+                        _, end_idx = self.find_block_content(content, start_idx)
+                        if not end_idx:
+                            cursor = m.end()
+                            continue
+
+                        block = content[start_idx:end_idx]
+                        parsed = self._parse_vic3_color_value(block)
+                        if parsed is not None:
+                            color = parsed
+
+                        cursor = end_idx
+
+        return color
+
     def scan_all_country_colors(self):
         """Scans both mod and vanilla for country colors. Returns {tag: (r,g,b)}."""
         colors = {}
+        effective_vanilla = self.get_effective_vanilla_path()
+
         paths = []
-        if self.mod_path: paths.append(os.path.join(self.mod_path, "common/country_definitions"))
-        if self.vanilla_path: paths.append(os.path.join(self.vanilla_path, "game/common/country_definitions"))
+        if effective_vanilla:
+            paths.append(os.path.join(effective_vanilla, "game", "common", "country_definitions"))
+        if self.mod_path:
+            paths.append(os.path.join(self.mod_path, "common", "country_definitions"))
 
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
+        skip_blocks = {
+            "AGENTS", "TIERS", "TYPES", "CULTURES", "RELIGIONS",
+            "COUNTRIES", "COUNTRY_DEFINITIONS", "DYNAMIC_COUNTRIES"
+        }
+
+        block_pattern = re.compile(
+            r"^\s*(?:c:)?([A-Z][A-Z0-9_]{1,4})\s*(?:\?=|=)\s*\{",
+            re.MULTILINE
+        )
+
+        for base_path in paths:
+            if not os.path.exists(base_path):
+                continue
+
+            for root, _, files in os.walk(base_path):
                 for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
+                    if not file.endswith(".txt"):
+                        continue
 
-                    # Find tags and colors
-                    # c:TAG = { ... color = { r g b } ... }
+                    fpath = os.path.join(root, file)
+                    try:
+                        with open(fpath, "r", encoding="utf-8-sig") as f:
+                            content = f.read()
+                    except Exception:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+
                     cursor = 0
                     while True:
-                        # Find tag definition start
-                        # Matches start of line or space + TAG + space + =
-                        # But more reliably: TAG = {
-                        # Standard paradox syntax: TAG = { ... }
-                        m = re.search(r"(?:^|\s)([A-Za-z0-9_]{3,})\s*=\s*\{", content[cursor:])
-                        if not m: break
+                        m = block_pattern.search(content, cursor)
+                        if not m:
+                            break
+
                         tag = m.group(1).upper()
-                        if tag in ["AGENTS", "TIERS", "TYPES", "CULTURES", "RELIGIONS"]: # Skip non-country blocks if any
-                             cursor += m.end()
-                             continue
+                        if tag in skip_blocks:
+                            cursor = m.end()
+                            continue
 
-                        start_idx = cursor + m.end() - 1
+                        start_idx = m.end() - 1
                         _, end_idx = self.find_block_content(content, start_idx)
+                        if not end_idx:
+                            cursor = m.end()
+                            continue
 
-                        if end_idx:
-                            block = content[start_idx:end_idx]
-                            # Look for color
-                            # color = { r g b } or color = rgb { r g b } or color = hsv { ... } or color = hsv360 { ... }
-                            c_match = re.search(r"color\s*=\s*(hsv360|hsv|rgb)?\s*\{\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\}", block, re.IGNORECASE)
-                            if c_match:
-                                c_type = c_match.group(1)
-                                v1, v2, v3 = float(c_match.group(2)), float(c_match.group(3)), float(c_match.group(4))
-                                rgb = (0,0,0)
-                                if c_type and c_type.lower() == 'hsv360':
-                                    h = v1 / 360.0
-                                    s = v2 / 100.0
-                                    v = v3 / 100.0
-                                    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-                                    rgb = (int(r * 255), int(g * 255), int(b * 255))
-                                elif c_type and c_type.lower() == 'hsv':
-                                    h = v1 if v1 <= 1.0 else v1/360.0
-                                    s = v2 if v2 <= 1.0 else v2/100.0
-                                    v = v3 if v3 <= 1.0 else v3/100.0
-                                    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-                                    rgb = (int(r * 255), int(g * 255), int(b * 255))
-                                else:
-                                    # rgb 0-255 or 0-1
-                                    if v1 <= 1.0 and v2 <= 1.0 and v3 <= 1.0 and (v1 > 0 or v2 > 0 or v3 > 0):
-                                         rgb = (int(v1*255), int(v2*255), int(v3*255))
-                                    else:
-                                         rgb = (int(v1), int(v2), int(v3))
+                        block = content[start_idx:end_idx]
+                        parsed = self._parse_vic3_color_value(block)
+                        if parsed is not None:
+                            colors[tag] = parsed
 
-                                # Mod overrides vanilla
-                                if tag not in colors or p.startswith(self.mod_path):
-                                    colors[tag] = rgb
+                        cursor = end_idx
 
-                            cursor = end_idx
-                        else:
-                            cursor += m.end()
         return colors
 
     def scan_definitions_for_options(self):
@@ -1959,9 +2266,8 @@ class Vic3Logic:
             "discoverable": [] # List of dicts {type, amount}
         }
 
-        # Normalize state name
-        if not state_name.startswith("STATE_"):
-            state_name = f"STATE_{state_name.upper()}"
+        # Normalize state name consistently with the rest of the tool.
+        state_name = self.normalize_state_key(state_name)
 
         found_content = None
         for p in paths:
@@ -2056,8 +2362,7 @@ class Vic3Logic:
                  mod_states_dir = os.path.join(self.mod_path, "map_data", "state_regions")
                  os.makedirs(mod_states_dir, exist_ok=True)
 
-        if not state_name.startswith("STATE_"):
-            state_name = f"STATE_{state_name.upper()}"
+        state_name = self.normalize_state_key(state_name)
 
         # Check existing mod file
         for root, _, files in os.walk(mod_states_dir):
@@ -7262,6 +7567,7 @@ class DemographicsMixer(ttk.Frame):
 class StateObject:
     def __init__(self, state_id):
         self.id = state_id
+        self.numeric_id = None
         self.provinces = set()
         self.hubs = {
             "city": None,
@@ -7289,13 +7595,13 @@ class StateManager:
         self.province_owner_map = {}
 
         paths = []
+        if self.logic.vanilla_path:
+            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
         if self.logic.mod_path:
             paths.append(os.path.join(self.logic.mod_path, "map/data/state_regions"))
             paths.append(os.path.join(self.logic.mod_path, "map_data/state_regions"))
-        if self.logic.vanilla_path:
-            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
 
-        for p in reversed(paths):
+        for p in paths:
             if not os.path.exists(p): continue
             for root, _, files in os.walk(p):
                 for file in files:
@@ -7345,6 +7651,11 @@ class StateManager:
                             nm = re.search(r"naval_exit_id\s*=\s*([0-9]+)", block)
                             if nm: sobj.naval_exit_id = nm.group(1)
 
+                            # Numeric Region ID
+                            id_match = re.search(r"(?m)^[ \t]*id\s*=\s*(\d+)", block)
+                            if id_match:
+                                sobj.numeric_id = int(id_match.group(1))
+
                             # Impassable
                             im = re.search(r"impassable\s*=\s*\{", block)
                             if im:
@@ -7360,6 +7671,150 @@ class StateManager:
                             cursor = e_idx
                         else:
                             cursor += 1
+
+    def _is_mod_state_file(self, file_path):
+        if not self.logic.mod_path or not file_path:
+            return False
+
+        mod_root = os.path.normcase(os.path.abspath(self.logic.mod_path))
+        candidate = os.path.normcase(os.path.abspath(file_path))
+        try:
+            return os.path.commonpath([candidate, mod_root]) == mod_root
+        except ValueError:
+            return False
+
+    def get_existing_state_numeric_ids(self, mod_only=False):
+        ids = []
+        for sobj in self.states.values():
+            if sobj.numeric_id is None:
+                continue
+            if mod_only and not self._is_mod_state_file(sobj.file_path):
+                continue
+            ids.append(sobj.numeric_id)
+        return ids
+
+    def get_next_state_numeric_id(self):
+        mod_ids = self.get_existing_state_numeric_ids(mod_only=True)
+        if mod_ids:
+            return max(mod_ids) + 1
+
+        all_ids = self.get_existing_state_numeric_ids(mod_only=False)
+        if all_ids:
+            return max(all_ids) + 1
+        return 1
+
+    def _normalize_state_hubs(self, state_id):
+        sobj = self.states.get(state_id)
+        if not sobj:
+            return
+
+        impassable_set = {p.lower() for p in sobj.impassable if p}
+        valid_provinces = sorted(p for p in sobj.provinces if p not in impassable_set)
+
+        for htype, h_hex in list(sobj.hubs.items()):
+            current_hub = h_hex.lower() if h_hex else None
+            if not current_hub or current_hub not in impassable_set:
+                continue
+
+            if htype == "port":
+                sobj.hubs["port"] = None
+                sobj.naval_exit_id = None
+                self.logic.log(f"[MAP] Cleared port hub for {state_id} because {current_hub} is impassable.")
+                continue
+
+            used_hubs = {
+                value.lower()
+                for key, value in sobj.hubs.items()
+                if key != htype and value and value.lower() not in impassable_set
+            }
+            candidates = [p for p in valid_provinces if p not in used_hubs]
+
+            new_hub = candidates[0] if candidates else (valid_provinces[0] if valid_provinces else None)
+            sobj.hubs[htype] = new_hub
+            if new_hub:
+                self.logic.log(f"[MAP] Moved {htype} hub for {state_id} to {new_hub} because {current_hub} is impassable.")
+            else:
+                self.logic.log(f"[MAP] Cleared {htype} hub for {state_id}; no valid non-impassable province remains.", 'warn')
+
+    def toggle_province_impassable(self, province_hex):
+        clean_hex = province_hex.lower()
+        owner_state = self.province_owner_map.get(clean_hex)
+        if not owner_state or owner_state not in self.states:
+            return None
+
+        affected_states = set()
+
+        for state_id, sobj in self.states.items():
+            filtered = [p.lower() for p in sobj.impassable if p.lower() in sobj.provinces]
+            if state_id != owner_state and clean_hex in filtered:
+                sobj.impassable = [p for p in filtered if p != clean_hex]
+                self._normalize_state_hubs(state_id)
+                affected_states.add(state_id)
+            else:
+                sobj.impassable = filtered
+
+        owner_obj = self.states[owner_state]
+        current_impassable = {p.lower() for p in owner_obj.impassable if p.lower() in owner_obj.provinces}
+        if clean_hex in current_impassable:
+            current_impassable.remove(clean_hex)
+            is_impassable = False
+        else:
+            current_impassable.add(clean_hex)
+            is_impassable = True
+
+        owner_obj.impassable = sorted(current_impassable)
+        self._normalize_state_hubs(owner_state)
+        affected_states.add(owner_state)
+
+        for state_id in affected_states:
+            self.save_state_region(state_id)
+
+        return owner_state, is_impassable, affected_states
+
+    def mark_provinces_impassable(self, province_hexes):
+        owner_targets = {}
+
+        for province_hex in province_hexes:
+            clean_hex = province_hex.lower()
+            owner_state = self.province_owner_map.get(clean_hex)
+            if not owner_state or owner_state not in self.states:
+                continue
+            owner_targets.setdefault(owner_state, set()).add(clean_hex)
+
+        if not owner_targets:
+            return 0, 0, set()
+
+        target_hexes = set()
+        for hexes in owner_targets.values():
+            target_hexes.update(hexes)
+
+        affected_states = set()
+        already_marked = 0
+        total_targets = sum(len(hexes) for hexes in owner_targets.values())
+
+        for state_id, sobj in self.states.items():
+            valid_impassable = {p.lower() for p in sobj.impassable if p.lower() in sobj.provinces}
+            original_impassable = set(valid_impassable)
+            owned_targets = owner_targets.get(state_id, set())
+
+            already_marked += len(owned_targets & valid_impassable)
+
+            if owned_targets:
+                valid_impassable.update(owned_targets)
+
+            stale_targets = target_hexes - owned_targets
+            if stale_targets:
+                valid_impassable.difference_update(stale_targets)
+
+            sobj.impassable = sorted(valid_impassable)
+            if valid_impassable != original_impassable:
+                self._normalize_state_hubs(state_id)
+                affected_states.add(state_id)
+
+        for state_id in affected_states:
+            self.save_state_region(state_id)
+
+        return total_targets - already_marked, already_marked, affected_states
 
     def transfer_state_assets(self, new_state_id, new_owner_tag=None, source_ratios=None):
         if not source_ratios: return 0
@@ -7748,7 +8203,7 @@ class StateManager:
                         with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(new_content)
                         self.logic.log(f"[CLEANUP] Removed {state_id} from history/{folder}/{file}")
 
-    def create_new_state(self, state_name_key, owner_data, province_list):
+    def create_new_state(self, state_name_key, owner_data, province_list, numeric_id=None, hub_assignments=None, naval_exit_id=None):
         state_id = self.logic.normalize_state_key(state_name_key)
 
         if state_id not in self.states:
@@ -7757,6 +8212,11 @@ class StateManager:
             sobj.file_path = os.path.join(self.logic.mod_path, "map_data", "state_regions", "99_custom_regions.txt")
             self.states[state_id] = sobj
             self.logic.log(f"Created new StateObject: {state_id}")
+        else:
+            sobj = self.states[state_id]
+
+        if numeric_id is not None and sobj.numeric_id is None:
+            sobj.numeric_id = numeric_id
 
         # Determine Strategic Region from "Loser" of first province
         strategic_region = None
@@ -7815,6 +8275,20 @@ class StateManager:
             else:
                 source_ratios[os_id] = 0.0
             self.logic.log(f"[TRANSFER] Taking {count}/{total} ({source_ratios[os_id]:.2%}) from {os_id}")
+
+        if hub_assignments is not None:
+            for hub_type in ["city", "farm", "mine", "wood"]:
+                hub_hex = hub_assignments.get(hub_type)
+                if hub_hex:
+                    sobj.hubs[hub_type] = hub_hex.lower()
+
+            port_hex = hub_assignments.get("port")
+            if port_hex:
+                sobj.hubs["port"] = port_hex.lower()
+                sobj.naval_exit_id = str(naval_exit_id) if naval_exit_id is not None else None
+            else:
+                sobj.hubs["port"] = None
+                sobj.naval_exit_id = None
 
         self._update_localization(state_id, state_name_key)
 
@@ -7894,7 +8368,7 @@ class StateManager:
         # Add to new
         self.update_history_provinces(state_id, history_additions, [])
 
-    def _update_localization(self, state_id, name):
+    def _update_localization(self, state_id, name, hub_names=None, overwrite_existing=False):
         loc_dir = os.path.join(self.logic.mod_path, "localization", "english")
         os.makedirs(loc_dir, exist_ok=True)
         fpath = os.path.join(loc_dir, "map_l_english.yml")
@@ -7907,8 +8381,51 @@ class StateManager:
         except:
             with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
 
-        if state_id + ":" not in content:
-            with open(fpath, 'a', encoding='utf-8-sig') as f: f.write(f' {state_id}:0 "{name}"\n')
+        entries = []
+        content_changed = False
+        hub_placeholder_suffixes = {
+            "city": "City",
+            "farm": "Farms",
+            "wood": "Logging Camps",
+            "mine": "Mines",
+            "port": "Port"
+        }
+
+        entries.append((state_id, name, True))
+        sobj = self.states.get(state_id)
+        if sobj:
+            for hub_type, suffix in hub_placeholder_suffixes.items():
+                if not sobj.hubs.get(hub_type):
+                    continue
+                hub_key = f"HUB_NAME_{state_id}_{hub_type}"
+                hub_name = hub_names.get(hub_type) if hub_names and hub_type in hub_names else f"{name} {suffix}"
+                entries.append((hub_key, hub_name, False))
+
+        missing_entries = []
+        for key, loc_text, include_zero in entries:
+            safe_text = self.logic.safe_str(loc_text)
+            line = f' {key}{":0" if include_zero else ":"} "{safe_text}"'
+            pattern = re.compile(r"(?m)^[ \t]*" + re.escape(key) + r":(?:0)?[ \t]*\"(?:[^\"\\]|\\.)*\"[ \t]*$")
+
+            if pattern.search(content):
+                if overwrite_existing:
+                    updated_content = pattern.sub(line, content, count=1)
+                    if updated_content != content:
+                        content = updated_content
+                        content_changed = True
+            else:
+                missing_entries.append(line)
+
+        if missing_entries:
+            entry = "\n".join(missing_entries) + "\n"
+            if content and not content.endswith(("\n", "\r")):
+                entry = "\n" + entry
+            content += entry
+            content_changed = True
+
+        if content_changed:
+            with open(fpath, 'w', encoding='utf-8-sig') as f:
+                f.write(content)
 
     def _init_history(self, state_id, owner_tag):
         hist_dir = os.path.join(self.logic.mod_path, "common", "history", "states")
@@ -8261,7 +8778,9 @@ class StateManager:
             return
 
         prov_str = " ".join(f'"{p.lower()}"' for p in sobj.provinces)
-        impass_str = " ".join(f'"{p.lower()}"' for p in sobj.impassable)
+        clean_impassable = sorted({p.lower() for p in sobj.impassable if p and p.lower() in sobj.provinces})
+        sobj.impassable = clean_impassable
+        impass_str = " ".join(clean_impassable)
 
         hubs_str = ""
         for k, v in sobj.hubs.items():
@@ -8272,20 +8791,26 @@ class StateManager:
 
         al_val = sobj.arable_land if sobj.arable_land is not None else 30
 
-        new_block = f"""{state_id} = {{
-    id = 1234
-    provinces = {{ {prov_str} }}
-    subsistence_building = "building_subsistence_farm"{hubs_str}{naval_str}{impass_block}
-    arable_land = {al_val}
-    arable_resources = {{ "bg_wheat_farms" "bg_livestock_ranches" }}
-    capped_resources = {{ "bg_lead_mining" 5 "bg_iron_mining" 5 "bg_logging" 10 }}
-}}
-"""
+        def append_block_line(block_text, line_text):
+            block_text = re.sub(r"\n?[ \t]*\}\s*$", "", block_text)
+            if not block_text.endswith("\n"):
+                block_text += "\n"
+            return block_text + f"\t{line_text}\n}}"
+
+        def cleanup_block_spacing(block_text):
+            return re.sub(r"\n(?:[ \t]*\n)+([ \t]*\})", r"\n\1", block_text)
+
         if re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content):
             m = re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content)
             s, e = self.logic.find_block_content(content, m.end() - 1)
             if s:
                 block = content[s:e]
+
+                if sobj.numeric_id is not None:
+                    if re.search(r"(?m)^[ \t]*id\s*=", block):
+                        block = re.sub(r"(?m)^([ \t]*)id\s*=\s*\d+", rf"\1id = {sobj.numeric_id}", block, count=1)
+                    else:
+                        block = block[:1] + f"\n\tid = {sobj.numeric_id}" + block[1:]
 
                 if re.search(r"provinces\s*=\s*\{", block):
                     p_s, p_e = self.logic.find_block_content(block, re.search(r"provinces\s*=\s*\{", block).end() - 1)
@@ -8297,22 +8822,60 @@ class StateManager:
                     if re.search(r"arable_land\s*=", block):
                         block = re.sub(r"arable_land\s*=\s*\d+", f"arable_land = {sobj.arable_land}", block)
                     else:
-                        # Append before closing brace
-                        block = block[:-1] + f"\n\tarable_land = {sobj.arable_land}\n}}"
+                        block = append_block_line(block, f"arable_land = {sobj.arable_land}")
 
                 for k, v in sobj.hubs.items():
                     if v:
                         if re.search(fr"{k}\s*=", block):
                             block = re.sub(fr'{k}\s*=\s*"?([xX0-9A-Fa-f]+)"?', f'{k} = "{v}"', block)
                         else:
-                            block = block[:-1] + f'\n\t{k} = "{v}"\n}}'
+                            block = append_block_line(block, f'{k} = "{v}"')
                     else:
                         # Hub removed/None, strip from file if present
                         if re.search(fr"{k}\s*=", block):
                             block = re.sub(fr'{k}\s*=\s*"?([xX0-9A-Fa-f]+)"?\s*\n?', '', block)
 
+                if sobj.naval_exit_id:
+                    if re.search(r"naval_exit_id\s*=", block):
+                        block = re.sub(r"naval_exit_id\s*=\s*\d+", f"naval_exit_id = {sobj.naval_exit_id}", block, count=1)
+                    else:
+                        block = append_block_line(block, f"naval_exit_id = {sobj.naval_exit_id}")
+                else:
+                    block = re.sub(r"(?m)^[ \t]*naval_exit_id\s*=\s*\d+[ \t]*\n?", "", block, count=1)
+
+                if sobj.impassable:
+                    if re.search(r"impassable\s*=\s*\{", block):
+                        block = re.sub(
+                            r"impassable\s*=\s*\{[^{}]*\}",
+                            f"impassable = {{ {impass_str} }}",
+                            block,
+                            count=1,
+                            flags=re.S
+                        )
+                    else:
+                        block = append_block_line(block, f"impassable = {{ {impass_str} }}")
+                else:
+                    block = re.sub(r"(?ms)^[ \t]*impassable\s*=\s*\{[^{}]*\}[ \t]*\n?", "", block, count=1)
+
+                block = cleanup_block_spacing(block)
+
                 content = content[:s] + block + content[e:]
         else:
+            region_numeric_id = sobj.numeric_id
+            if region_numeric_id is None:
+                region_numeric_id = self.get_next_state_numeric_id()
+                sobj.numeric_id = region_numeric_id
+                self.logic.log(f"[WARN] No numeric ID loaded for {state_id}; defaulted to {region_numeric_id}.", 'warn')
+
+            new_block = f"""{state_id} = {{
+    id = {region_numeric_id}
+    provinces = {{ {prov_str} }}
+    subsistence_building = "building_subsistence_farm"{hubs_str}{naval_str}{impass_block}
+    arable_land = {al_val}
+    arable_resources = {{ "bg_wheat_farms" "bg_livestock_ranches" }}
+    capped_resources = {{ "bg_lead_mining" 5 "bg_iron_mining" 5 "bg_logging" 10 }}
+}}
+"""
             content += "\n" + new_block
 
         with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
@@ -8527,10 +9090,31 @@ class App(tk.Tk):
         self.style.configure("Treeview", background="white", foreground="black", fieldbackground="white")
         self.style.map("Treeview", background=[('selected', '#00ACC1')], foreground=[('selected', 'white')])
 
+    def get_app_base_dir(self):
+        try:
+            if getattr(sys, "frozen", False):
+                return os.path.dirname(os.path.abspath(sys.executable))
+            return os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            return os.getcwd()
+
+    def get_config_path(self):
+        return os.path.join(self.get_app_base_dir(), "config.json")
+
+    def get_config_search_paths(self):
+        paths = [self.get_config_path()]
+        legacy_path = os.path.abspath("config.json")
+        if legacy_path not in paths:
+            paths.append(legacy_path)
+        return paths
+
     def load_config(self):
         try:
-            if os.path.exists("config.json"):
-                with open("config.json", "r") as f:
+            for config_path in self.get_config_search_paths():
+                if not os.path.exists(config_path):
+                    continue
+
+                with open(config_path, "r") as f:
                     data = json.load(f)
                     path = data.get("mod_path", "")
                     if os.path.exists(path):
@@ -8543,11 +9127,12 @@ class App(tk.Tk):
                         self.vanilla_path_var.set(v_path)
                         self.logic.set_vanilla_path(v_path)
                         self.log_message(f"Loaded Vanilla Path: {v_path}")
+                break
         except: pass
 
     def save_config(self):
         try:
-            with open("config.json", "w") as f:
+            with open(self.get_config_path(), "w") as f:
                 json.dump({
                     "mod_path": self.path_var.get(),
                     "vanilla_path": self.vanilla_path_var.get()
@@ -8712,7 +9297,7 @@ class App(tk.Tk):
         if path and os.path.exists(path):
             return path
 
-        messagebox.showinfo("Setup", r"Select the victoria 3/game folder, e.g: C:\Program Files (x86)\Steam\steamapps\common\Victoria 3\game")
+        messagebox.showinfo("Setup", r"Select the Victoria 3 install folder (either the game root or the game subfolder), e.g: C:\Program Files (x86)\Steam\steamapps\common\Victoria 3")
         folder = filedialog.askdirectory(title="Select Vanilla Game Directory")
         if folder:
             self.vanilla_path_var.set(folder)
@@ -12060,15 +12645,44 @@ class Vic3ProvincePainter(tk.Toplevel):
 
         # Data Containers
         self.original_map_image = None # Original Full-Res PIL Image
+        self.original_rgb_array = None
         self.display_image = None # Tkinter Image
+        self.canvas_image_id = None
         self.province_to_state = {} # hex -> state_name
         self.state_province_map = {} # state_name -> [hex, hex, ...]
         self.province_owner_map = {} # hex -> owner_tag
         self.country_colors = {} # tag -> (r,g,b)
-        self.province_indices = None # Numpy array of hex colors (or mapped indices)
+        self.province_indices = None # Backward-compatible alias kept for older checks
+        self.province_rgb_array = None
+        self.province_label_map = None
+        self.packed_hex_cache = {}
+        self.unique_province_values = np.array([], dtype=np.int32)
+        self.unique_province_hexes = []
+        self.province_value_to_label = {}
+        self.province_bounds = {}
+        self.province_region_cache = {}
+        self.selection_overlay_items = {}
+        self.base_render_array = None
+        self.base_render_mode = None
+        self.base_render_scale = None
+        self.selected_packed_values = np.array([], dtype=np.int32)
+        self.selected_fill_colors = {}
+        self.impassable_provinces = set()
+        self.impassable_packed_values = np.array([], dtype=np.int32)
         self.map_width = 0
         self.map_height = 0
+        self.source_width = 0
+        self.source_height = 0
         self.scale_factor = 0.25
+        self._load_request_id = 0
+        self._zoom_after_id = None
+        self._zoom_anchor = None
+        self._is_panning = False
+        self._viewport_after_id = None
+        self._left_drag_start = None
+        self._left_drag_active = False
+        self._left_drag_box_id = None
+        self._left_drag_threshold = 6
 
         self.pending_transfers = [] # List of (state, old_tag, new_tag)
 
@@ -12076,12 +12690,734 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.view_mode = "POLITICAL" # POLITICAL, PROVINCE, CUSTOM_STATE
         self.selected_provinces = set() # Set of hex strings
         self.custom_target_state = None # For Custom State Mode
+        self.pending_state_creation = None
+        self.pending_hub_step = None
+        self.impassable_mode = False
 
         if self.start_mode == "CUSTOM_STATE":
             self.view_mode = "PROVINCE" # Start showing provinces
 
         self._build_ui()
         self.after(100, self.start_loading)
+
+    def _invalidate_base_render(self):
+        self.base_render_array = None
+        self.base_render_mode = None
+        self.base_render_scale = None
+
+    def _clear_scaled_map_cache(self):
+        self._clear_selection_overlays()
+        self.province_indices = None
+        self.province_rgb_array = None
+        self.province_label_map = None
+        self.packed_hex_cache = {}
+        self.unique_province_values = np.array([], dtype=np.int32)
+        self.unique_province_hexes = []
+        self.province_value_to_label = {}
+        self.province_bounds = {}
+        self.province_region_cache = {}
+        self._invalidate_base_render()
+
+    def _refresh_selected_cache(self):
+        if not self.selected_provinces:
+            self.selected_packed_values = np.array([], dtype=np.int32)
+            self.selected_fill_colors = {}
+            return
+
+        packed_values = []
+        fill_colors = {}
+
+        for hex_code in self.selected_provinces:
+            try:
+                packed = self._hex_to_packed_rgb(hex_code)
+            except ValueError:
+                continue
+
+            packed_values.append(packed)
+            fallback_color = (
+                (packed >> 16) & 0xFF,
+                (packed >> 8) & 0xFF,
+                packed & 0xFF,
+            )
+            fill_colors[packed] = self._get_selected_fill_color(hex_code, fallback_color)
+
+        self.selected_packed_values = (
+            np.array(packed_values, dtype=np.int32)
+            if packed_values
+            else np.array([], dtype=np.int32)
+        )
+        self.selected_fill_colors = fill_colors
+
+    def _refresh_impassable_cache(self):
+        impassable = set()
+        for state_id, sobj in self.logic.state_manager.states.items():
+            province_set = {p.lower() for p in sobj.provinces}
+            for province_hex in sobj.impassable:
+                clean_hex = province_hex.lower()
+                if clean_hex in province_set and self.logic.state_manager.province_owner_map.get(clean_hex) == state_id:
+                    impassable.add(clean_hex)
+
+        self.impassable_provinces = impassable
+        packed_values = []
+        for hex_code in impassable:
+            try:
+                packed_values.append(self._hex_to_packed_rgb(hex_code))
+            except ValueError:
+                continue
+
+        self.impassable_packed_values = (
+            np.array(packed_values, dtype=np.int32)
+            if packed_values
+            else np.array([], dtype=np.int32)
+        )
+
+    def _supports_drag_box(self):
+        if self.pending_state_creation and self.pending_hub_step:
+            return False
+        return self.impassable_mode or self.view_mode == "PROVINCE" or self.start_mode == "CUSTOM_STATE"
+
+    def _clear_drag_box(self):
+        if self._left_drag_box_id is not None:
+            self.canvas.delete(self._left_drag_box_id)
+            self._left_drag_box_id = None
+
+    def _get_canvas_event_point(self, event):
+        return self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+
+    def _get_hexes_in_canvas_box(self, x0, y0, x1, y1):
+        if self.original_rgb_array is None:
+            return set()
+
+        left = max(int(min(x0, x1)), 0)
+        top = max(int(min(y0, y1)), 0)
+        right = min(int(max(x0, x1)), self.map_width - 1)
+        bottom = min(int(max(y0, y1)), self.map_height - 1)
+
+        if right < left or bottom < top:
+            return set()
+
+        scale = max(self.scale_factor, 0.0001)
+        src_left = min(int(left / scale), self.source_width - 1)
+        src_top = min(int(top / scale), self.source_height - 1)
+        src_right = min(int(right / scale), self.source_width - 1)
+        src_bottom = min(int(bottom / scale), self.source_height - 1)
+
+        rgb_slice = self.original_rgb_array[src_top:src_bottom + 1, src_left:src_right + 1]
+        if rgb_slice.size == 0:
+            return set()
+
+        packed_slice = (
+            rgb_slice[:, :, 0].astype(np.int32) << 16
+        ) + (
+            rgb_slice[:, :, 1].astype(np.int32) << 8
+        ) + rgb_slice[:, :, 2].astype(np.int32)
+
+        province_hexes = set()
+        for packed in np.unique(packed_slice.reshape(-1)).tolist():
+            hex_code = self._packed_to_hex(packed)
+            if self.impassable_mode:
+                owner_state = self.logic.state_manager.province_owner_map.get(hex_code)
+                if owner_state and owner_state in self.logic.state_manager.states:
+                    province_hexes.add(hex_code)
+            else:
+                if hex_code in self.province_to_state:
+                    province_hexes.add(hex_code)
+
+        return province_hexes
+
+    def _apply_box_selection(self, province_hexes):
+        if not province_hexes:
+            self._set_default_status(prefix="Selection box did not cover any state provinces.")
+            return
+
+        new_provinces = province_hexes - self.selected_provinces
+        if not new_provinces:
+            self._set_default_status(prefix=f"Selection box covered {len(province_hexes)} provinces; all were already selected.")
+            return
+
+        self.selected_provinces.update(new_provinces)
+        self._refresh_selected_cache()
+        self.refresh_map()
+        self.status_var.set(f"Selected {len(new_provinces)} provinces from box. Total selected: {len(self.selected_provinces)}.")
+
+    def _apply_impassable_box(self, province_hexes):
+        if not province_hexes:
+            self._set_default_status(prefix="Selection box did not cover any owned state provinces.")
+            return
+
+        marked_count, already_marked, affected_states = self.logic.state_manager.mark_provinces_impassable(province_hexes)
+        total_box = len(province_hexes)
+
+        if affected_states:
+            self._refresh_impassable_cache()
+            self.refresh_map()
+            state_count = len(affected_states)
+            if marked_count > 0:
+                already_suffix = f" ({already_marked} already impassable)." if already_marked else "."
+                self.status_var.set(
+                    f"Marked {marked_count} provinces impassable from box across {state_count} state{'s' if state_count != 1 else ''}{already_suffix}"
+                )
+            elif already_marked > 0:
+                self.status_var.set(f"All {already_marked} provinces in box were already impassable.")
+            else:
+                self.status_var.set(f"Updated impassable entries across {state_count} state{'s' if state_count != 1 else ''}.")
+            return
+
+        if already_marked == total_box:
+            self.status_var.set(f"All {already_marked} provinces in box were already impassable.")
+        else:
+            self._set_default_status(prefix="No impassable changes were needed for the selection box.")
+
+    def _capture_view_anchor(self, event=None):
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+
+        if event is not None:
+            screen_x = min(max(event.x, 0), canvas_width)
+            screen_y = min(max(event.y, 0), canvas_height)
+        else:
+            screen_x = canvas_width / 2
+            screen_y = canvas_height / 2
+
+        return {
+            "world_x": self.canvas.canvasx(screen_x) / max(self.scale_factor, 0.0001),
+            "world_y": self.canvas.canvasy(screen_y) / max(self.scale_factor, 0.0001),
+            "rel_x": screen_x / canvas_width,
+            "rel_y": screen_y / canvas_height,
+        }
+
+    def _restore_view_anchor(self, anchor):
+        if not anchor:
+            return
+
+        self.update_idletasks()
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+
+        rel_x = min(max(anchor.get("rel_x", 0.5), 0.0), 1.0)
+        rel_y = min(max(anchor.get("rel_y", 0.5), 0.0), 1.0)
+
+        anchor_x = anchor.get("world_x", 0.0) * self.scale_factor
+        anchor_y = anchor.get("world_y", 0.0) * self.scale_factor
+
+        left = anchor_x - (canvas_width * rel_x)
+        top = anchor_y - (canvas_height * rel_y)
+
+        if self.map_width <= canvas_width:
+            x_fraction = 0.0
+        else:
+            max_x_fraction = 1.0 - (canvas_width / max(self.map_width, 1))
+            x_fraction = min(max(left / max(self.map_width, 1), 0.0), max_x_fraction)
+
+        if self.map_height <= canvas_height:
+            y_fraction = 0.0
+        else:
+            max_y_fraction = 1.0 - (canvas_height / max(self.map_height, 1))
+            y_fraction = min(max(top / max(self.map_height, 1), 0.0), max_y_fraction)
+
+        self.canvas.xview_moveto(x_fraction)
+        self.canvas.yview_moveto(y_fraction)
+
+    def _queue_viewport_refresh(self, delay=0):
+        if self._viewport_after_id is not None:
+            self.after_cancel(self._viewport_after_id)
+        self._viewport_after_id = self.after(delay, self._run_viewport_refresh)
+
+    def _run_viewport_refresh(self):
+        self._viewport_after_id = None
+        self.refresh_map()
+
+    def _update_virtual_map_size(self):
+        self.map_width = max(int(round(self.source_width * self.scale_factor)), 1)
+        self.map_height = max(int(round(self.source_height * self.scale_factor)), 1)
+
+    def _get_default_status_message(self):
+        if self.pending_state_creation and self.pending_hub_step:
+            labels = {
+                "city": "City",
+                "farm": "Farm",
+                "mine": "Mine",
+                "wood": "Wood",
+                "port": "Port"
+            }
+            label = labels.get(self.pending_hub_step, self.pending_hub_step.title())
+            return f"Hub selection: click a selected province for the {label} hub."
+        if self.impassable_mode:
+            return "Impassable mode: left click to toggle one province, or drag a box to mark many impassable."
+        if self.start_mode == "CUSTOM_STATE":
+            return "Ready. Left click or drag a box to select provinces, right click to set target state."
+        if self.view_mode == "PROVINCE":
+            return "Province selector: left click or drag a box to select provinces."
+        return "Ready. Left Click to Paint, Right Click to Pick."
+
+    def _set_default_status(self, prefix=None):
+        message = self._get_default_status_message()
+        if prefix:
+            message = f"{prefix} {message}"
+        self.status_var.set(message)
+
+    def _cancel_pending_state_creation(self, show_message=False):
+        self.pending_state_creation = None
+        self.pending_hub_step = None
+        if show_message:
+            messagebox.showinfo("Cancelled", "State creation cancelled.")
+        self._set_default_status()
+
+    def _prompt_localization_value(self, prompt, default_value):
+        value = simpledialog.askstring(
+            "Create State",
+            prompt,
+            initialvalue=default_value
+        )
+        if value is None:
+            return default_value
+        value = value.strip()
+        return value if value else default_value
+
+    def _prompt_state_localization_names(self, state_id, fallback_state_name):
+        sobj = self.logic.state_manager.states.get(state_id)
+        if not sobj:
+            return
+
+        state_default = self.logic.get_loc_text(state_id)
+        if state_default == state_id:
+            state_default = fallback_state_name
+
+        state_loc_name = self._prompt_localization_value(
+            "Enter State localization name:",
+            state_default
+        )
+
+        hub_defaults = {
+            "city": "City",
+            "farm": "Farms",
+            "mine": "Mines",
+            "wood": "Logging Camps",
+            "port": "Port"
+        }
+        hub_names = {}
+        for hub_type, suffix in hub_defaults.items():
+            if not sobj.hubs.get(hub_type):
+                continue
+
+            hub_key = f"HUB_NAME_{state_id}_{hub_type}"
+            default_name = self.logic.get_loc_text(hub_key)
+            if default_name == hub_key:
+                default_name = f"{state_loc_name} {suffix}"
+
+            hub_names[hub_type] = self._prompt_localization_value(
+                f"Enter {hub_type.title()} hub localization name:",
+                default_name
+            )
+
+        self.logic.state_manager._update_localization(
+            state_id,
+            state_loc_name,
+            hub_names=hub_names,
+            overwrite_existing=True
+        )
+
+    def _begin_hub_selection(self, name, owner_data, numeric_id):
+        province_list = list(self.selected_provinces)
+        if isinstance(owner_data, dict):
+            stored_owner_data = {tag: list(provs) for tag, provs in owner_data.items()}
+        else:
+            stored_owner_data = owner_data
+
+        self.pending_state_creation = {
+            "name": name,
+            "owner_data": stored_owner_data,
+            "numeric_id": numeric_id,
+            "province_list": province_list,
+            "province_set": set(province_list),
+            "hub_assignments": {}
+        }
+        self.pending_hub_step = "city"
+        self.lift()
+        self.focus_force()
+        messagebox.showinfo(
+            "Hub Selection",
+            "Click a selected province for the City hub.\n\n"
+            "You will then pick Farm, Mine, and Wood hubs on the map. "
+            "Use Clear Selection if you want to cancel."
+        )
+        self._set_default_status()
+
+    def _finalize_pending_state_creation(self):
+        if not self.pending_state_creation:
+            return
+
+        data = self.pending_state_creation
+        hub_assignments = dict(data.get("hub_assignments", {}))
+        naval_exit_id = data.get("naval_exit_id")
+        name = data["name"]
+
+        self.logic.state_manager.create_new_state(
+            name,
+            data["owner_data"],
+            list(data["province_list"]),
+            data["numeric_id"],
+            hub_assignments=hub_assignments,
+            naval_exit_id=naval_exit_id
+        )
+        self._prompt_state_localization_names(self.logic.normalize_state_key(name), name)
+
+        self.pending_state_creation = None
+        self.pending_hub_step = None
+        self.selected_provinces.clear()
+        self._refresh_selected_cache()
+        self.reload_data()
+        messagebox.showinfo("Success", f"Created state {name}.")
+
+    def _handle_hub_selection_click(self, hex_code):
+        data = self.pending_state_creation
+        if not data or not self.pending_hub_step:
+            return
+
+        if hex_code not in data["province_set"]:
+            self._set_default_status(prefix=f"{hex_code} is not part of the new state.")
+            return
+
+        current_step = self.pending_hub_step
+        data["hub_assignments"][current_step] = hex_code
+
+        next_steps = {
+            "city": "farm",
+            "farm": "mine",
+            "mine": "wood"
+        }
+
+        if current_step in next_steps:
+            self.pending_hub_step = next_steps[current_step]
+            self._set_default_status(prefix=f"{current_step.title()} hub set to {hex_code}.")
+            return
+
+        if current_step == "wood":
+            self.pending_hub_step = None
+            has_port = messagebox.askyesno("Create State", "Does this state have a port?")
+            if has_port:
+                self.pending_hub_step = "port"
+                self._set_default_status(prefix=f"Wood hub set to {hex_code}.")
+            else:
+                data["hub_assignments"]["port"] = None
+                data["naval_exit_id"] = None
+                self._finalize_pending_state_creation()
+            return
+
+        if current_step == "port":
+            naval_exit_id = simpledialog.askinteger(
+                "Create State",
+                "Enter Naval Exit ID:",
+                minvalue=1
+            )
+            if naval_exit_id is None:
+                self._cancel_pending_state_creation(show_message=True)
+                return
+            data["naval_exit_id"] = str(naval_exit_id)
+            self.pending_hub_step = None
+            self._finalize_pending_state_creation()
+
+    def _get_visible_viewport(self):
+        if self.original_rgb_array is None:
+            return None
+
+        self.update_idletasks()
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        view_left = max(int(self.canvas.canvasx(0)), 0)
+        view_top = max(int(self.canvas.canvasy(0)), 0)
+
+        x1 = min(view_left + canvas_width, self.map_width)
+        y1 = min(view_top + canvas_height, self.map_height)
+        render_width = max(x1 - view_left, 0)
+        render_height = max(y1 - view_top, 0)
+
+        final_img = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
+        final_packed = None
+
+        if render_width <= 0 or render_height <= 0:
+            return {
+                "image": final_img,
+                "packed": final_packed,
+                "canvas_width": canvas_width,
+                "canvas_height": canvas_height,
+                "view_left": view_left,
+                "view_top": view_top,
+            }
+
+        display_x = view_left + np.arange(render_width, dtype=np.float32)
+        display_y = view_top + np.arange(render_height, dtype=np.float32)
+        src_x = np.clip((display_x / self.scale_factor).astype(np.int32), 0, self.source_width - 1)
+        src_y = np.clip((display_y / self.scale_factor).astype(np.int32), 0, self.source_height - 1)
+
+        visible_rgb = self.original_rgb_array[src_y[:, None], src_x[None, :]]
+        visible_packed = (
+            visible_rgb[:, :, 0].astype(np.int32) << 16
+        ) + (
+            visible_rgb[:, :, 1].astype(np.int32) << 8
+        ) + visible_rgb[:, :, 2].astype(np.int32)
+
+        final_img[:render_height, :render_width] = visible_rgb
+        final_packed = visible_packed
+
+        return {
+            "image": final_img,
+            "packed": final_packed,
+            "canvas_width": canvas_width,
+            "canvas_height": canvas_height,
+            "view_left": view_left,
+            "view_top": view_top,
+            "render_width": render_width,
+            "render_height": render_height,
+        }
+
+    def _queue_zoom(self, new_scale, anchor=None):
+        clamped_scale = min(max(new_scale, 0.05), 2.0)
+        if abs(clamped_scale - self.scale_factor) < 0.0001:
+            return
+
+        if anchor is None:
+            anchor = self._capture_view_anchor()
+
+        self.scale_factor = clamped_scale
+        self._zoom_anchor = anchor
+
+        if self._zoom_after_id is not None:
+            self.after_cancel(self._zoom_after_id)
+
+        self.status_var.set(f"Zooming to {int(round(self.scale_factor * 100))}%...")
+        self._zoom_after_id = self.after(10, self._apply_zoom)
+
+    def _apply_zoom(self):
+        self._zoom_after_id = None
+        if self.original_rgb_array is None:
+            return
+
+        try:
+            anchor = self._zoom_anchor
+            self._update_virtual_map_size()
+            self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
+            self._restore_view_anchor(anchor)
+            self.refresh_map()
+            self._set_default_status()
+        except Exception as e:
+            self.status_var.set(f"Error: {e}")
+            traceback.print_exc()
+        finally:
+            self._zoom_anchor = None
+
+    def _build_province_bounds(self):
+        self.province_bounds = {}
+        if self.province_indices is None:
+            return
+
+        if self.province_label_map is not None and len(self.unique_province_values) > 0:
+            label_count = len(self.unique_province_values)
+            min_x = np.full(label_count, self.map_width, dtype=np.int32)
+            max_x = np.full(label_count, -1, dtype=np.int32)
+            min_y = np.full(label_count, self.map_height, dtype=np.int32)
+            max_y = np.full(label_count, -1, dtype=np.int32)
+
+            for y in range(self.map_height):
+                row = self.province_label_map[y]
+                seen, first_idx = np.unique(row, return_index=True)
+                if seen.size == 0:
+                    continue
+
+                _, reverse_idx = np.unique(row[::-1], return_index=True)
+                last_idx = (self.map_width - 1) - reverse_idx
+
+                np.minimum.at(min_x, seen, first_idx)
+                np.maximum.at(max_x, seen, last_idx)
+                np.minimum.at(min_y, seen, y)
+                np.maximum.at(max_y, seen, y)
+
+            for label in range(label_count):
+                if max_x[label] >= 0 and max_y[label] >= 0:
+                    self.province_bounds[label] = (
+                        int(min_x[label]),
+                        int(min_y[label]),
+                        int(max_x[label]),
+                        int(max_y[label]),
+                    )
+            return
+
+        for y in range(self.map_height):
+            row = self.province_indices[y]
+            seen, first_idx = np.unique(row, return_index=True)
+            if seen.size == 0:
+                continue
+
+            _, reverse_idx = np.unique(row[::-1], return_index=True)
+            last_idx = (self.map_width - 1) - reverse_idx
+
+            for packed_value, first_x, last_x in zip(seen.tolist(), first_idx.tolist(), last_idx.tolist()):
+                packed_key = int(packed_value)
+                bounds = self.province_bounds.get(packed_key)
+                if bounds is None:
+                    self.province_bounds[packed_key] = [int(first_x), y, int(last_x), y]
+                else:
+                    if first_x < bounds[0]:
+                        bounds[0] = int(first_x)
+                    if last_x > bounds[2]:
+                        bounds[2] = int(last_x)
+                    bounds[3] = y
+
+    def _packed_to_hex(self, packed):
+        packed_key = int(packed)
+        cached = self.packed_hex_cache.get(packed_key)
+        if cached is not None:
+            return cached
+
+        hex_code = "x{:02x}{:02x}{:02x}".format(
+            (packed_key >> 16) & 0xFF,
+            (packed_key >> 8) & 0xFF,
+            packed_key & 0xFF,
+        )
+        self.packed_hex_cache[packed_key] = hex_code
+        return hex_code
+
+    def _get_hex_at_canvas_pixel(self, ix, iy):
+        if self.original_rgb_array is None:
+            return None
+        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height:
+            return None
+
+        src_x = min(int(ix / max(self.scale_factor, 0.0001)), self.source_width - 1)
+        src_y = min(int(iy / max(self.scale_factor, 0.0001)), self.source_height - 1)
+        rgb = self.original_rgb_array[src_y, src_x]
+        packed = (int(rgb[0]) << 16) + (int(rgb[1]) << 8) + int(rgb[2])
+        return self._packed_to_hex(packed)
+
+    def _get_label_for_hex(self, hex_code):
+        try:
+            packed = self._hex_to_packed_rgb(hex_code)
+        except ValueError:
+            return None
+        return self.province_value_to_label.get(packed)
+
+    def _get_province_region_data(self, hex_code):
+        packed = self._hex_to_packed_rgb(hex_code)
+        cache_key = packed
+        compare_value = packed
+        source_array = self.province_indices
+
+        if self.province_label_map is not None:
+            label = self._get_label_for_hex(hex_code)
+            if label is None:
+                return None
+            cache_key = label
+            compare_value = label
+            source_array = self.province_label_map
+
+        cached = self.province_region_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        bounds = self.province_bounds.get(cache_key)
+        if not bounds:
+            return None
+
+        min_x, min_y, max_x, max_y = bounds
+        x0 = max(min_x - 1, 0)
+        y0 = max(min_y - 1, 0)
+        x1 = min(max_x + 2, self.map_width)
+        y1 = min(max_y + 2, self.map_height)
+
+        value_slice = source_array[y0:y1, x0:x1]
+        selected_mask = value_slice == compare_value
+        outline_mask = self._get_selected_outline_mask(selected_mask, value_slice)
+
+        region_data = (x0, y0, x1, y1, selected_mask, outline_mask)
+        self.province_region_cache[cache_key] = region_data
+        return region_data
+
+    def _clear_selection_overlays(self):
+        for overlay in self.selection_overlay_items.values():
+            self.canvas.delete(overlay["item"])
+        self.selection_overlay_items = {}
+
+    def _sync_selection_overlays(self, full_refresh=False):
+        if full_refresh:
+            self._clear_selection_overlays()
+
+        selected = set(self.selected_provinces)
+        existing = set(self.selection_overlay_items)
+
+        for hex_code in existing - selected:
+            overlay = self.selection_overlay_items.pop(hex_code, None)
+            if overlay is not None:
+                self.canvas.delete(overlay["item"])
+
+        if self.province_indices is None:
+            return
+
+        base_render = self._get_base_render()
+        outline_color = np.array([18, 18, 18], dtype=np.uint8)
+
+        for hex_code in selected:
+            region_data = self._get_province_region_data(hex_code)
+            if region_data is None:
+                continue
+
+            x0, y0, x1, y1, selected_mask, outline_mask = region_data
+            overlay_rgba = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.uint8)
+
+            if self.view_mode == "POLITICAL" and base_render is not None:
+                base_region = base_render[y0:y1, x0:x1]
+                selected_pixels = base_region[selected_mask].astype(np.uint16)
+                overlay_rgba[selected_mask, :3] = ((selected_pixels * 7) + (255 * 3)) // 10
+            else:
+                packed = self._hex_to_packed_rgb(hex_code)
+                fallback_color = (
+                    (packed >> 16) & 0xFF,
+                    (packed >> 8) & 0xFF,
+                    packed & 0xFF,
+                )
+                overlay_rgba[selected_mask, :3] = self._get_selected_fill_color(hex_code, fallback_color)
+
+            overlay_rgba[selected_mask, 3] = 255
+            overlay_rgba[outline_mask, :3] = outline_color
+            overlay_rgba[outline_mask, 3] = 255
+
+            photo = ImageTk.PhotoImage(Image.fromarray(overlay_rgba, mode="RGBA"))
+            existing_overlay = self.selection_overlay_items.get(hex_code)
+            if existing_overlay is None:
+                item_id = self.canvas.create_image(x0, y0, image=photo, anchor="nw")
+                self.selection_overlay_items[hex_code] = {"item": item_id, "image": photo}
+            else:
+                self.canvas.itemconfig(existing_overlay["item"], image=photo)
+                self.canvas.coords(existing_overlay["item"], x0, y0)
+                existing_overlay["image"] = photo
+
+    def _get_base_render(self):
+        if self.province_indices is None:
+            return None
+
+        if (
+            self.base_render_array is not None
+            and self.base_render_mode == self.view_mode
+            and self.base_render_scale == self.scale_factor
+        ):
+            return self.base_render_array
+
+        if self.view_mode == "PROVINCE" or self.province_label_map is None:
+            base = self.province_rgb_array
+        else:
+            default_color = (50, 50, 50)
+            palette = np.full((len(self.unique_province_values), 3), 50, dtype=np.uint8)
+
+            for label, hex_code in enumerate(self.unique_province_hexes):
+                owner = self.province_owner_map.get(hex_code)
+                if owner:
+                    palette[label] = self.get_owner_display_color(owner) or default_color
+
+            base = palette[self.province_label_map]
+
+        self.base_render_array = np.ascontiguousarray(base)
+        self.base_render_mode = self.view_mode
+        self.base_render_scale = self.scale_factor
+        return self.base_render_array
 
     def ask_split_choice(self, owners, options=None, default_tag=None):
         """Helper to ask user how to handle multiple owners."""
@@ -12157,6 +13493,8 @@ class Vic3ProvincePainter(tk.Toplevel):
 
             tk.Button(toolbar, text="Transfer Selected to Target", command=self.modify_state_action, bg="#FFA726", fg="black").pack(side=tk.LEFT, padx=10)
             tk.Button(toolbar, text="Create New State", command=self.create_new_state_action, bg="#66BB6A", fg="black").pack(side=tk.LEFT, padx=5)
+            self.btn_impassable_mode = tk.Button(toolbar, text="Make Impassable", command=self.toggle_impassable_mode, bg="#8E24AA", fg="white")
+            self.btn_impassable_mode.pack(side=tk.LEFT, padx=5)
             tk.Button(toolbar, text="Clear Selection", command=self.clear_selection, bg="#424242", fg="white").pack(side=tk.LEFT, padx=5)
 
         else:
@@ -12198,14 +13536,17 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.canvas = tk.Canvas(self.canvas_frame, bg="#101010", highlightthickness=0,
                                 xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
 
-        self.h_scroll.config(command=self.canvas.xview)
-        self.v_scroll.config(command=self.canvas.yview)
+        self.h_scroll.config(command=self.on_horizontal_scroll)
+        self.v_scroll.config(command=self.on_vertical_scroll)
 
         self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.canvas.bind("<Configure>", self.on_canvas_configure)
 
-        self.canvas.bind("<Button-1>", self.on_click)
+        self.canvas.bind("<ButtonPress-1>", self.on_left_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_left_button_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_button_release)
         self.canvas.bind("<Button-3>", self.on_right_click)
 
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
@@ -12213,26 +13554,110 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.canvas.bind("<Button-5>", self.on_mousewheel)
         self.canvas.bind("<ButtonPress-2>", self.start_pan)
         self.canvas.bind("<B2-Motion>", self.do_pan)
+        self.canvas.bind("<ButtonRelease-2>", self.end_pan)
+
+    def on_left_button_press(self, event):
+        self._left_drag_start = self._get_canvas_event_point(event)
+        self._left_drag_active = False
+        self._clear_drag_box()
+        return "break"
+
+    def on_left_button_drag(self, event):
+        if self._left_drag_start is None or not self._supports_drag_box():
+            return "break"
+
+        curr_x, curr_y = self._get_canvas_event_point(event)
+        start_x, start_y = self._left_drag_start
+
+        if not self._left_drag_active:
+            moved_x = abs(curr_x - start_x)
+            moved_y = abs(curr_y - start_y)
+            if moved_x < self._left_drag_threshold and moved_y < self._left_drag_threshold:
+                return "break"
+            self._left_drag_active = True
+            self._left_drag_box_id = self.canvas.create_rectangle(
+                start_x,
+                start_y,
+                curr_x,
+                curr_y,
+                outline="#FFEE58" if self.impassable_mode else "#4FC3F7",
+                width=2,
+                dash=(6, 3)
+            )
+        else:
+            self.canvas.coords(self._left_drag_box_id, start_x, start_y, curr_x, curr_y)
+
+        return "break"
+
+    def on_left_button_release(self, event):
+        if self._left_drag_start is None:
+            return "break"
+
+        start_x, start_y = self._left_drag_start
+        end_x, end_y = self._get_canvas_event_point(event)
+        was_drag = self._left_drag_active
+
+        self._left_drag_start = None
+        self._left_drag_active = False
+        self._clear_drag_box()
+
+        if was_drag and self._supports_drag_box():
+            province_hexes = self._get_hexes_in_canvas_box(start_x, start_y, end_x, end_y)
+            if self.impassable_mode:
+                self._apply_impassable_box(province_hexes)
+            else:
+                self._apply_box_selection(province_hexes)
+            return "break"
+
+        return self.on_click(event)
 
     def start_pan(self, event):
+        self._is_panning = True
+        self.canvas.configure(cursor="fleur")
         self.canvas.scan_mark(event.x, event.y)
+        return "break"
 
     def do_pan(self, event):
+        if not self._is_panning:
+            return "break"
         self.canvas.scan_dragto(event.x, event.y, gain=1)
+        self._queue_viewport_refresh(0)
+        return "break"
+
+    def end_pan(self, event):
+        self._is_panning = False
+        self.canvas.configure(cursor="")
+        self._queue_viewport_refresh(0)
+        return "break"
+
+    def on_horizontal_scroll(self, *args):
+        self.canvas.xview(*args)
+        self._queue_viewport_refresh(0)
+
+    def on_vertical_scroll(self, *args):
+        self.canvas.yview(*args)
+        self._queue_viewport_refresh(0)
+
+    def on_canvas_configure(self, event):
+        self._queue_viewport_refresh(0)
 
     def on_mousewheel(self, event):
         num = getattr(event, 'num', None)
         delta = getattr(event, 'delta', 0)
+        anchor = self._capture_view_anchor(event)
         if num == 4 or delta > 0:
-            self.zoom_in()
+            self.zoom_in(anchor=anchor)
         elif num == 5 or delta < 0:
-            self.zoom_out()
+            self.zoom_out(anchor=anchor)
+        return "break"
 
     def start_loading(self, reload_image=True):
         self.status_var.set("Loading Data...")
-        threading.Thread(target=self.load_data, args=(reload_image,), daemon=True).start()
+        self._load_request_id += 1
+        load_id = self._load_request_id
+        threading.Thread(target=self.load_data, args=(load_id, reload_image), daemon=True).start()
 
-    def load_data(self, reload_image):
+    def load_data(self, load_id, reload_image):
         try:
             # Sync backend state manager first
             self.logic.state_manager.load_state_regions()
@@ -12243,6 +13668,10 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.state_province_map = {}
             self.province_owner_map = {}
             self.pending_transfers = []
+            self._invalidate_base_render()
+            if reload_image:
+                self.original_map_image = None
+                self.original_rgb_array = None
 
             # 1. Colors
             self.country_colors = self.logic.scan_all_country_colors()
@@ -12252,29 +13681,39 @@ class Vic3ProvincePainter(tk.Toplevel):
 
             # 3. History (State+Hex -> Owner)
             self.parse_history_states()
+            self._refresh_selected_cache()
+            self._refresh_impassable_cache()
 
             # 4. Map Image (Only if needed)
-            if reload_image or self.province_indices is None:
+            if reload_image or self.original_rgb_array is None:
                 self.load_province_map()
 
             # 5. Render (Schedule on Main Thread)
-            self.after(0, self.finish_loading_success)
+            self.after(0, lambda lid=load_id: self.finish_loading_success(lid))
 
         except Exception as e:
-            self.after(0, lambda: self.status_var.set(f"Error: {e}"))
+            self.after(0, lambda err=e, lid=load_id: self.finish_loading_error(lid, err))
             traceback.print_exc()
 
-    def finish_loading_success(self):
+    def finish_loading_error(self, load_id, error):
+        if load_id != self._load_request_id:
+            return
+        self.status_var.set(f"Error: {error}")
+
+    def finish_loading_success(self, load_id):
+        if load_id != self._load_request_id:
+            return
         self.refresh_map()
-        self.status_var.set("Ready. Left Click to Paint, Right Click to Pick.")
+        self._set_default_status()
 
     def parse_state_regions(self):
-        # Scan map/data/state_regions
+        # Load vanilla first, then modded state regions so mod files override.
         paths = []
+        if self.logic.vanilla_path:
+            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
         if self.logic.mod_path:
             paths.append(os.path.join(self.logic.mod_path, "map/data/state_regions"))
             paths.append(os.path.join(self.logic.mod_path, "map_data/state_regions"))
-        if self.logic.vanilla_path: paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
 
         for p in paths:
             if not os.path.exists(p): continue
@@ -12337,7 +13776,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                     # s:STATE = { create_state = { country = c:TAG owned_provinces = { ... } } }
                     cursor = 0
                     while True:
-                        m = re.search(r"s:(STATE_[A-Za-z0-9_]+)\s*=\s*\{", content[cursor:])
+                        m = re.search(r"s:(STATE_[A-Za-z0-9_]+)\s*(?:\?=|=)\s*\{", content[cursor:])
                         if not m: break
                         state_name = m.group(1)
                         s_idx, e_idx = self.logic.find_block_content(content, cursor + m.end() - 1)
@@ -12388,139 +13827,228 @@ class Vic3ProvincePainter(tk.Toplevel):
                             cursor += 1
 
     def load_province_map(self):
-        # Load cached or from disk
-        if self.original_map_image is None:
-            # Try mod then vanilla
+        if self.original_rgb_array is None:
             candidates = []
             if self.logic.mod_path:
                 candidates.append(os.path.join(self.logic.mod_path, "map/data/provinces.png"))
                 candidates.append(os.path.join(self.logic.mod_path, "map_data/provinces.png"))
-            if self.logic.vanilla_path: candidates.append(os.path.join(self.logic.vanilla_path, "game/map/data/provinces.png"))
+            if self.logic.vanilla_path:
+                candidates.append(os.path.join(self.logic.vanilla_path, "game/map/data/provinces.png"))
 
             path = next((x for x in candidates if os.path.exists(x)), None)
             if not path:
                 raise FileNotFoundError("provinces.png not found")
 
-            self.original_map_image = Image.open(path)
-            self.original_map_image.load() # Ensure loaded
+            self.original_map_image = Image.open(path).convert("RGB")
+            self.original_map_image.load()
+            self.original_rgb_array = np.ascontiguousarray(np.array(self.original_map_image, dtype=np.uint8))
+            self.source_height, self.source_width = self.original_rgb_array.shape[:2]
+            self._clear_scaled_map_cache()
 
-        # Downscale from original
-        img = self.original_map_image
-        w, h = img.size
-        new_w, new_h = int(w * self.scale_factor), int(h * self.scale_factor)
+        self._update_virtual_map_size()
 
-        # Limit minimum size
-        if new_w < 100 or new_h < 100:
-             new_w, new_h = 100, 100
+    def zoom_in(self, anchor=None):
+        self._queue_zoom(self.scale_factor + 0.1, anchor=anchor)
 
-        img_small = img.resize((new_w, new_h), resample=Image.Resampling.NEAREST)
+    def zoom_out(self, anchor=None):
+        self._queue_zoom(self.scale_factor - 0.1, anchor=anchor)
 
-        self.map_width, self.map_height = new_w, new_h
+    def get_owner_display_color(self, owner):
+        """Returns the real country color when available, otherwise a stable fallback."""
+        if not owner:
+            return None
 
-        # Convert to numpy array of indices (packed RGB)
-        arr = np.array(img_small) # (H, W, 3)
-        R = arr[:,:,0].astype(np.int32)
-        G = arr[:,:,1].astype(np.int32)
-        B = arr[:,:,2].astype(np.int32)
-        self.province_indices = (R << 16) + (G << 8) + B
+        clean_owner = owner.replace("c:", "").strip().upper()
+        if clean_owner in self.country_colors:
+            return self.country_colors[clean_owner]
 
-        # Clean up heavy RGB array
-        del arr
+        # Lazy exact lookup covers cases where the bulk scan missed a tag or when
+        # the user only configured a mod path and we need to auto-detect vanilla.
+        exact = self.logic.find_country_color(clean_owner)
+        if exact is not None:
+            self.country_colors[clean_owner] = exact
+            return exact
 
-    def zoom_in(self):
-        self.scale_factor = min(self.scale_factor + 0.1, 2.0)
-        self.start_loading(reload_image=True)
+        # Deterministic fallback color so the political map stays readable even if
+        # a tag color still cannot be resolved.
+        seed = sum((i + 1) * ord(ch) for i, ch in enumerate(clean_owner))
+        hue = (seed % 360) / 360.0
+        sat = 0.58
+        val = 0.82
+        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
+        return (int(r * 255), int(g * 255), int(b * 255))
 
-    def zoom_out(self):
-        self.scale_factor = max(self.scale_factor - 0.1, 0.05)
-        self.start_loading(reload_image=True)
+    def _hex_to_packed_rgb(self, hex_code):
+        clean = str(hex_code).strip().lower()
+        if clean.startswith("x"):
+            clean = clean[1:]
+        if len(clean) != 6:
+            raise ValueError(f"Invalid province hex code: {hex_code}")
+        return int(clean, 16)
+
+    def _get_selected_fill_color(self, hex_code, fallback_rgb):
+        owner = self.province_owner_map.get(hex_code)
+        base_color = self.get_owner_display_color(owner) if owner else fallback_rgb
+        if base_color is None:
+            base_color = fallback_rgb
+
+        # Keep the owner tint visible while still making the selection pop.
+        return tuple((channel * 6 + 255 * 4) // 10 for channel in base_color)
+
+    def _expand_mask(self, mask, iterations=1):
+        expanded = mask.copy()
+        for _ in range(iterations):
+            grown = expanded.copy()
+            grown[:, 1:] |= expanded[:, :-1]
+            grown[:, :-1] |= expanded[:, 1:]
+            grown[1:, :] |= expanded[:-1, :]
+            grown[:-1, :] |= expanded[1:, :]
+            expanded = grown
+        return expanded
+
+    def _get_selected_outline_mask(self, selected_mask, label_slice):
+        outline_mask = np.zeros_like(selected_mask, dtype=bool)
+        if not np.any(selected_mask):
+            return outline_mask
+
+        horizontal_diff = label_slice[:, 1:] != label_slice[:, :-1]
+        vertical_diff = label_slice[1:, :] != label_slice[:-1, :]
+
+        outline_mask[:, 1:] |= selected_mask[:, 1:] & horizontal_diff
+        outline_mask[:, :-1] |= selected_mask[:, :-1] & horizontal_diff
+        outline_mask[1:, :] |= selected_mask[1:, :] & vertical_diff
+        outline_mask[:-1, :] |= selected_mask[:-1, :] & vertical_diff
+
+        if self.scale_factor >= 1.0:
+            outline_mask = self._expand_mask(outline_mask, 1)
+
+        return outline_mask
 
     def refresh_map(self):
-        if self.province_indices is None: return
+        if self.original_rgb_array is None:
+            return
 
-        # Get unique colors from the index array
-        uniques = np.unique(self.province_indices)
+        viewport = self._get_visible_viewport()
+        if viewport is None:
+            return
 
-        # Initialize lookup arrays
-        # Max value 0xFFFFFF = 16777215
-        lookup_r = np.zeros(16777216, dtype=np.uint8)
-        lookup_g = np.zeros(16777216, dtype=np.uint8)
-        lookup_b = np.zeros(16777216, dtype=np.uint8)
+        final_img = viewport["image"]
+        view_packed = viewport.get("packed")
+        render_width = viewport.get("render_width", 0)
+        render_height = viewport.get("render_height", 0)
+        visible_region = final_img[:render_height, :render_width]
+        selected_values = self.selected_packed_values if not self.impassable_mode else np.array([], dtype=np.int32)
+        impassable_values = self.impassable_packed_values if self.impassable_mode else np.array([], dtype=np.int32)
+        outline_color = np.array([18, 18, 18], dtype=np.uint8)
+        impassable_color = np.array([160, 48, 48], dtype=np.uint8)
+        impassable_outline_color = np.array([64, 12, 12], dtype=np.uint8)
 
-        if self.view_mode == "POLITICAL":
-            # Default grey
-            lookup_r[:] = 50; lookup_g[:] = 50; lookup_b[:] = 50
-            default_color = (50, 50, 50)
+        if view_packed is not None and render_width > 0 and render_height > 0:
+            unique_values = None
+            inverse_map = None
 
-            for packed_rgb in uniques:
-                # Unpack to Hex for lookup
-                r = (packed_rgb >> 16) & 0xFF
-                g = (packed_rgb >> 8) & 0xFF
-                b = packed_rgb & 0xFF
+            if self.view_mode == "POLITICAL":
+                unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
+                inverse_map = inverse.reshape(render_height, render_width)
+                palette = np.full((len(unique_values), 3), 50, dtype=np.uint8)
 
-                hex_code = "x{:02x}{:02x}{:02x}".format(r, g, b)
+                for idx, packed in enumerate(unique_values):
+                    owner = self.province_owner_map.get(self._packed_to_hex(packed))
+                    if owner:
+                        palette[idx] = self.get_owner_display_color(owner) or (50, 50, 50)
 
-                owner = self.province_owner_map.get(hex_code)
-                target_col = default_color
-                if owner:
-                    target_col = self.country_colors.get(owner, (150, 150, 150))
+                visible_region[:, :] = palette[inverse_map]
 
-                lookup_r[packed_rgb] = target_col[0]
-                lookup_g[packed_rgb] = target_col[1]
-                lookup_b[packed_rgb] = target_col[2]
+            if impassable_values.size > 0:
+                if unique_values is None or inverse_map is None:
+                    unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
+                    inverse_map = inverse.reshape(render_height, render_width)
 
-        else: # PROVINCE MODE
-            # We want to show original province colors, but override selected ones
+                impassable_unique_mask = np.isin(unique_values, impassable_values)
+                if np.any(impassable_unique_mask):
+                    impassable_mask = impassable_unique_mask[inverse_map]
+                    impassable_pixels = visible_region[impassable_mask].astype(np.uint16)
+                    visible_region[impassable_mask] = ((impassable_pixels * 6) + (impassable_color * 4)) // 10
 
-            # 1. Fill lookup with identity (color = index) for uniques
-            # We can iterate uniques to set the lookup table.
-            for packed_rgb in uniques:
-                r = (packed_rgb >> 16) & 0xFF
-                g = (packed_rgb >> 8) & 0xFF
-                b = packed_rgb & 0xFF
-                lookup_r[packed_rgb] = r
-                lookup_g[packed_rgb] = g
-                lookup_b[packed_rgb] = b
+                    impassable_outline_mask = self._get_selected_outline_mask(impassable_mask, view_packed)
+                    if np.any(impassable_outline_mask):
+                        visible_region[impassable_outline_mask] = impassable_outline_color
 
-            # 2. Highlight selected
-            for hex_code in self.selected_provinces:
-                # convert hex "xRRGGBB" to int
-                try:
-                    clean = hex_code.replace("x", "")
-                    val = int(clean, 16)
-                    if val < 16777216:
-                        lookup_r[val] = 255
-                        lookup_g[val] = 255
-                        lookup_b[val] = 255
-                except: pass
+            if selected_values.size > 0:
+                if unique_values is None or inverse_map is None:
+                    unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
+                    inverse_map = inverse.reshape(render_height, render_width)
 
-        out_r = lookup_r[self.province_indices]
-        out_g = lookup_g[self.province_indices]
-        out_b = lookup_b[self.province_indices]
+                selected_unique_mask = np.isin(unique_values, selected_values)
+                if np.any(selected_unique_mask):
+                    selected_mask = selected_unique_mask[inverse_map]
 
-        final_img = np.dstack((out_r, out_g, out_b))
+                    if self.view_mode == "PROVINCE":
+                        highlight_palette = np.zeros((len(unique_values), 3), dtype=np.uint8)
+                        selected_indices = np.flatnonzero(selected_unique_mask)
+                        for idx in selected_indices:
+                            packed = int(unique_values[idx])
+                            highlight_palette[idx] = self.selected_fill_colors.get(
+                                packed,
+                                (
+                                    (packed >> 16) & 0xFF,
+                                    (packed >> 8) & 0xFF,
+                                    packed & 0xFF,
+                                ),
+                            )
+                        visible_region[selected_mask] = highlight_palette[inverse_map][selected_mask]
+                    else:
+                        selected_pixels = visible_region[selected_mask].astype(np.uint16)
+                        visible_region[selected_mask] = ((selected_pixels * 7) + (255 * 3)) // 10
+
+                    outline_mask = self._get_selected_outline_mask(selected_mask, view_packed)
+                    if np.any(outline_mask):
+                        visible_region[outline_mask] = outline_color
 
         pil_img = Image.fromarray(final_img)
         self.display_image = ImageTk.PhotoImage(pil_img)
 
         self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
-        # Clear existing image items to prevent memory leaks/overdraw
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, image=self.display_image, anchor="nw")
+        if self.canvas_image_id is None:
+            self.canvas_image_id = self.canvas.create_image(
+                viewport["view_left"],
+                viewport["view_top"],
+                image=self.display_image,
+                anchor="nw",
+            )
+        else:
+            self.canvas.itemconfig(self.canvas_image_id, image=self.display_image)
+            self.canvas.coords(self.canvas_image_id, viewport["view_left"], viewport["view_top"])
 
     def on_click(self, event):
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
 
         ix, iy = int(x), int(y)
-        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height: return
+        hex_code = self._get_hex_at_canvas_pixel(ix, iy)
+        if not hex_code:
+            return
 
-        # Identify Province from packed index
-        packed = self.province_indices[iy, ix]
-        r = (packed >> 16) & 0xFF
-        g = (packed >> 8) & 0xFF
-        b = packed & 0xFF
-        hex_code = "x{:02X}{:02X}{:02X}".format(r, g, b).lower()
+        if self.pending_state_creation and self.pending_hub_step:
+            self._handle_hub_selection_click(hex_code)
+            return
+
+        if self.impassable_mode:
+            result = self.logic.state_manager.toggle_province_impassable(hex_code)
+            if not result:
+                self.status_var.set(f"Could not resolve an owning state for {hex_code}.")
+                return
+
+            owner_state, is_impassable, affected_states = result
+            self._refresh_impassable_cache()
+            self.refresh_map()
+            if is_impassable:
+                self.status_var.set(f"Marked {hex_code} impassable in {owner_state}.")
+            else:
+                self.status_var.set(f"Removed {hex_code} from impassable in {owner_state}.")
+            if len(affected_states) > 1:
+                self.logic.log(f"[MAP] Cleaned stale impassable references for {hex_code} in {len(affected_states)} state files.")
+            return
 
         state = self.province_to_state.get(hex_code)
         owner = self.province_owner_map.get(hex_code, "None")
@@ -12533,6 +14061,7 @@ class Vic3ProvincePainter(tk.Toplevel):
             else:
                 self.selected_provinces.add(hex_code)
                 self.status_var.set(f"Selected {hex_code}")
+            self._refresh_selected_cache()
             self.refresh_map()
         else:
             # Political Paint Mode
@@ -12550,22 +14079,26 @@ class Vic3ProvincePainter(tk.Toplevel):
                         if self.province_owner_map.get(h) == owner:
                             self.province_owner_map[h] = new_tag
 
+                self._invalidate_base_render()
                 self.refresh_map()
                 self.status_var.set(f"Painted {state} ({owner} -> {new_tag})")
             else:
                 self.status_var.set(f"Province: {hex_code} | State: {state} | Owner: {owner}")
 
     def on_right_click(self, event):
+        if self.pending_state_creation and self.pending_hub_step:
+            self._set_default_status()
+            return
+        if self.impassable_mode:
+            self._set_default_status()
+            return
+
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
         ix, iy = int(x), int(y)
-        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height: return
-
-        packed = self.province_indices[iy, ix]
-        r = (packed >> 16) & 0xFF
-        g = (packed >> 8) & 0xFF
-        b = packed & 0xFF
-        hex_code = "x{:02X}{:02X}{:02X}".format(r, g, b).lower()
+        hex_code = self._get_hex_at_canvas_pixel(ix, iy)
+        if not hex_code:
+            return
 
         owner = self.province_owner_map.get(hex_code)
 
@@ -12578,6 +14111,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                     self.target_state_var.set("None")
                     self.status_var.set("Target State Deselected")
                     self.selected_provinces.clear()
+                    self._refresh_selected_cache()
                     self.refresh_map()
                 else:
                     self.custom_target_state = state
@@ -12589,6 +14123,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                         self.selected_provinces.clear()
                         for p in self.state_province_map[state]:
                             self.selected_provinces.add(p)
+                        self._refresh_selected_cache()
                         self.refresh_map()
         else:
             if owner and owner != "None":
@@ -12703,6 +14238,7 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.btn_prov_mode.config(text="Province Selector", bg="#424242")
             self.btn_export.pack_forget()
         self.refresh_map()
+        self._set_default_status()
 
     def export_selected_provinces(self):
         if not self.selected_provinces:
@@ -12724,10 +14260,24 @@ class Vic3ProvincePainter(tk.Toplevel):
         txt.focus_set()
 
     def clear_selection(self):
+        if self.pending_state_creation:
+            if not messagebox.askyesno("Cancel State Creation", "Cancel the pending state creation and clear the current selection?"):
+                return
+            self.pending_state_creation = None
+            self.pending_hub_step = None
         self.selected_provinces.clear()
+        self._refresh_selected_cache()
         self.refresh_map()
+        self._set_default_status()
 
     def modify_state_action(self):
+        if self.pending_state_creation:
+            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+        if self.impassable_mode:
+            messagebox.showerror("Error", "Exit impassable mode before transferring provinces.")
+            return
+
         if not self.custom_target_state:
             messagebox.showerror("Error", "No Target State selected (Right-Click a state).")
             return
@@ -12908,10 +14458,53 @@ class Vic3ProvincePainter(tk.Toplevel):
                             self.logic.state_manager.move_orphaned_region_state(old_state_id, tag, self.custom_target_state)
 
             self.selected_provinces.clear()
+            self._refresh_selected_cache()
             self.reload_data()
             messagebox.showinfo("Success", "Transferred provinces.")
 
+    def toggle_impassable_mode(self):
+        if self.pending_state_creation:
+            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+
+        self.impassable_mode = not self.impassable_mode
+        if self.start_mode == "CUSTOM_STATE":
+            if self.impassable_mode:
+                self.btn_impassable_mode.config(text="Exit Impassable Mode", bg="#C62828")
+            else:
+                self.btn_impassable_mode.config(text="Make Impassable", bg="#8E24AA")
+        self._set_default_status()
+        self.refresh_map()
+
+    def prompt_new_state_numeric_id(self):
+        default_id = self.logic.state_manager.get_next_state_numeric_id()
+        used_ids = set(self.logic.state_manager.get_existing_state_numeric_ids())
+
+        while True:
+            numeric_id = simpledialog.askinteger(
+                "Create State",
+                "Enter State ID:",
+                initialvalue=default_id,
+                minvalue=1
+            )
+            if numeric_id is None:
+                return None
+            if numeric_id in used_ids:
+                messagebox.showerror("Error", f"State ID {numeric_id} is already in use.")
+                default_id = numeric_id + 1
+                while default_id in used_ids:
+                    default_id += 1
+                continue
+            return numeric_id
+
     def create_new_state_action(self):
+        if self.pending_state_creation:
+            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
+            return
+        if self.impassable_mode:
+            messagebox.showerror("Error", "Exit impassable mode before creating a new state.")
+            return
+
         if not self.selected_provinces:
             messagebox.showerror("Error", "No provinces selected.")
             return
@@ -12937,6 +14530,8 @@ class Vic3ProvincePainter(tk.Toplevel):
         name = simpledialog.askstring("Create State", "Enter State Name (e.g. Texas):")
         if not name: return
 
+        owner_data = None
+
         if split_strategy == "single":
             if target_owner:
                 owner = target_owner
@@ -12945,7 +14540,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                 if not owner: return
 
             clean_owner = self.logic.format_tag_clean(owner)
-            self.logic.state_manager.create_new_state(name, clean_owner, list(self.selected_provinces))
+            owner_data = clean_owner
 
         else: # split
             # Build dict {tag: [provs]}
@@ -12967,9 +14562,19 @@ class Vic3ProvincePainter(tk.Toplevel):
                          first = list(found_owners)[0]
                          owner_data[first].append(p)
 
-            self.logic.state_manager.create_new_state(name, owner_data, list(self.selected_provinces))
+        numeric_id = self.prompt_new_state_numeric_id()
+        if numeric_id is None:
+            return
+
+        if messagebox.askyesno("Create State", "Would you like to specify hub provinces manually?"):
+            self._begin_hub_selection(name, owner_data, numeric_id)
+            return
+
+        self.logic.state_manager.create_new_state(name, owner_data, list(self.selected_provinces), numeric_id)
+        self._prompt_state_localization_names(self.logic.normalize_state_key(name), name)
 
         self.selected_provinces.clear()
+        self._refresh_selected_cache()
         self.reload_data()
         messagebox.showinfo("Success", f"Created state {name}.")
 
