@@ -18,250 +18,450 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-
-def _resolve_popup_parent(explicit_parent=None):
-    candidates = []
-    if explicit_parent is not None:
-        candidates.append(explicit_parent)
-
-    root = getattr(tk, "_default_root", None)
-    if root is not None:
-        for getter in (root.grab_current, root.focus_get):
-            try:
-                candidate = getter()
-            except Exception:
-                candidate = None
-            if candidate is not None:
-                candidates.append(candidate)
-
-        try:
-            pointer_widget = root.winfo_containing(root.winfo_pointerx(), root.winfo_pointery())
-        except Exception:
-            pointer_widget = None
-        if pointer_widget is not None:
-            candidates.append(pointer_widget)
-
-        candidates.append(root)
-
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            window = candidate if isinstance(candidate, (tk.Tk, tk.Toplevel)) else candidate.winfo_toplevel()
-            if window is not None and window.winfo_exists():
-                return window
-        except Exception:
-            continue
-    return None
-
-
-def _restore_topmost(window, value):
-    try:
-        if window is not None and window.winfo_exists():
-            window.attributes("-topmost", value)
-    except Exception:
-        pass
-
-
-def _call_dialog_with_front_parent(func, *args, **kwargs):
-    parent = _resolve_popup_parent(kwargs.get("parent"))
-    if parent is not None:
-        kwargs["parent"] = parent
-
-    if parent is not None:
-        try:
-            parent.lift()
-            parent.focus_force()
-            parent.update_idletasks()
-        except Exception:
-            pass
-
-    return func(*args, **kwargs)
-
-
-def _patch_dialog_function(module, function_name):
-    original = getattr(module, function_name, None)
-    if not callable(original):
-        return
-
-    def wrapped(*args, _original=original, **kwargs):
-        return _call_dialog_with_front_parent(_original, *args, **kwargs)
-
-    setattr(module, function_name, wrapped)
-
-
-def _activate_popup_window(window, parent=None):
-    try:
-        if window is None or not window.winfo_exists():
-            return
-    except Exception:
-        return
-
-    try:
-        if parent is not None and parent.winfo_exists():
-            window.lift(parent)
-        else:
-            window.lift()
-    except Exception:
-        pass
-
-    try:
-        previous_topmost = bool(int(window.attributes("-topmost")))
-    except Exception:
-        previous_topmost = False
-
-    topmost_applied = False
-    try:
-        window.attributes("-topmost", True)
-        topmost_applied = True
-    except Exception:
-        pass
-
-    try:
-        window.focus_force()
-    except Exception:
-        pass
-
-    if topmost_applied:
-        try:
-            window.after(50, lambda w=window, value=previous_topmost: _restore_topmost(w, value))
-        except Exception:
-            pass
-
-
-_ORIGINAL_TOPLEVEL_INIT = tk.Toplevel.__init__
-
-
-def _patched_toplevel_init(self, master=None, cnf=None, **kw):
-    if cnf is None:
-        cnf = {}
-    _ORIGINAL_TOPLEVEL_INIT(self, master, cnf, **kw)
-    parent = _resolve_popup_parent(master)
-    try:
-        self.after_idle(lambda win=self, popup_parent=parent: _activate_popup_window(win, popup_parent))
-    except Exception:
-        pass
-
-
-tk.Toplevel.__init__ = _patched_toplevel_init
-
-for _dialog_func in [
-    "showinfo", "showwarning", "showerror", "askquestion", "askokcancel",
-    "askretrycancel", "askyesno", "askyesnocancel"
-]:
-    _patch_dialog_function(messagebox, _dialog_func)
-
-for _dialog_func in ["askstring", "askinteger", "askfloat"]:
-    _patch_dialog_function(simpledialog, _dialog_func)
-
-for _dialog_func in [
-    "askopenfilename", "askopenfilenames", "askopenfile", "askopenfiles",
-    "asksaveasfilename", "asksaveasfile", "askdirectory"
-]:
-    _patch_dialog_function(filedialog, _dialog_func)
-
-_patch_dialog_function(colorchooser, "askcolor")
-
 # =============================================================================
 #  CORE LOGIC
 # =============================================================================
 
+
+# V3MT 2: lossless script utilities. Offsets always refer to the original text.
+from pathlib import Path
+import tempfile
+import hashlib
+import math
+import uuid
+
+APP_VERSION = "2.4.0"
+MOD_DIRECTORIES = (
+    "common/country_definitions", "common/history/countries", "common/history/states",
+    "common/history/pops", "common/history/population", "common/history/buildings",
+    "common/history/military_formations", "common/history/characters",
+    "common/history/diplomacy", "common/history/treaties", "common/history/trade",
+    "common/history/power_blocs", "common/history/lobbies", "common/history/companies",
+    "common/cultures", "common/religions", "common/coat_of_arms/coat_of_arms",
+    "common/strategic_regions", "common/journal_entries", "common/static_modifiers",
+    "events", "localization/english", "map_data/state_regions"
+)
+
+
+def script_tokens(text):
+    """Skip comments; keep escaped strings and all token offsets intact."""
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c.isspace() or c == '\ufeff':
+            i += 1
+        elif c == '#':
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end + 1
+        elif c == '"':
+            start = i
+            i += 1
+            while i < len(text):
+                if text[i] == '\\':
+                    i += 2
+                elif text[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            else:
+                raise ValueError(f'Unclosed string at character {start}')
+            yield text[start:i], start, i
+        elif text[i:i+2] in ('?=', '>=', '<=', '!=', '=='):
+            yield text[i:i+2], i, i+2
+            i += 2
+        elif c in '{}=<>':
+            yield c, i, i+1
+            i += 1
+        else:
+            start = i
+            while i < len(text) and not text[i].isspace() and text[i] not in '{}=<>#"':
+                if text[i:i+2] in ('?=', '!='): break
+                i += 1
+            if i == start: i += 1
+            yield text[start:i], start, i
+
+
+def script_blocks(text, key=None, depth=None):
+    tokens = list(script_tokens(text))
+    stack, result = [], []
+    for i, (token, start, end) in enumerate(tokens):
+        if token == '{':
+            name = tokens[i-2][0] if i >= 2 and tokens[i-1][0] in ('=', '?=') else None
+            begin = tokens[i-2][1] if name else start
+            stack.append((name, begin, start, len(stack)))
+        elif token == '}':
+            if not stack: raise ValueError(f'Unexpected closing brace at character {start}')
+            name, begin, opening, level = stack.pop()
+            if (key is None or name == key) and (depth is None or level == depth):
+                result.append(dict(key=name, start=begin, opening=opening, end=end, depth=level))
+    if stack: raise ValueError('Unclosed script block')
+    return sorted(result, key=lambda b: b['start'])
+
+
+def script_fields(body):
+    """Direct scalar assignments only; never confuse a unit's type with its formation."""
+    tokens = list(script_tokens(body))
+    level, result = 0, {}
+    for i, (token, start, end) in enumerate(tokens):
+        if token == '{': level += 1
+        elif token == '}': level -= 1
+        elif level == 0 and i+2 < len(tokens) and tokens[i+1][0] in ('=', '?='):
+            value, a, b = tokens[i+2]
+            if value != '{': result[token] = (value, start, b)
+    return result
+
+
+def field(body, key, default=''):
+    value = script_fields(body).get(key, (default, 0, 0))[0]
+    return value[1:-1].replace('\\"', '"').replace('\\\\', '\\') if value.startswith('"') else value
+
+
+def put_field(body, key, value):
+    entry = script_fields(body).get(key)
+    line = key + ' = ' + str(value)
+    return body[:entry[1]] + line + body[entry[2]:] if entry else body.rstrip() + '\n    ' + line + '\n'
+
+
+def quoted(value):
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\r', '').replace('\n', '\\n') + '"'
+
+
+def identifier(value, label='Identifier'):
+    value = str(value).strip()
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', value):
+        raise ValueError(f'{label} must contain letters, digits and underscores, and start with a letter or underscore.')
+    return value
+
+
+def nonnegative(value, label='Count'):
+    if isinstance(value, bool) or not re.fullmatch(r'\d+', str(value).strip()):
+        raise ValueError(f'{label} must be a non-negative integer.')
+    return int(value)
+
+
+def atomic_text(path, text, localization=False):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.suffix == '.txt': script_blocks(text)
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name, suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8-sig' if localization else 'utf-8', newline='\n') as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+
+def apportion(total, weights):
+    """Largest remainders: deterministic integer counts that add to the requested total."""
+    total = nonnegative(total, 'Total')
+    if not weights or sum(weights) <= 0:
+        if total: raise ValueError('Cannot distribute a positive total across zero population.')
+        return [0] * len(weights)
+    if any(w < 0 or not math.isfinite(w) for w in weights): raise ValueError('Invalid weights')
+    values = [total*w/sum(weights) for w in weights]
+    result = [math.floor(v) for v in values]
+    for i in sorted(range(len(weights)), key=lambda i: (-(values[i]-result[i]), i))[:total-sum(result)]:
+        result[i] += 1
+    return result
+
+
+
+import functools
+import inspect
+
+
+def mod_operation(function):
+    """Serialize edits; rollback text changes if validation or an operation fails."""
+    signature=inspect.signature(function)
+    @functools.wraps(function)
+    def run(self,*args,**kwargs):
+        logic=self if isinstance(self,Vic3Logic) else self.logic
+        logic._require_mod()
+        bound=signature.bind(self,*args,**kwargs); bound.apply_defaults()
+        for name,value in bound.arguments.items():
+            if value is None or value=='': continue
+            if name in {'tag','new_tag','old_tag','target_tag','source_tag','land_owner_tag','building_owner_tag','region_tag','owner_tag','donor_tag'}:
+                identifier(logic.format_tag_clean(value),'Country tag')
+            elif name in {'key','je_id','namespace','mod_name','building_type','new_culture','new_religion'} and isinstance(value,str): identifier(value,name)
+            elif name in {'new_total','new_size','total_pop','new_level','level'}: nonnegative(value,name)
+        if function.__name__=='save_event':
+            if not re.fullmatch(re.escape(bound.arguments['namespace'])+r'\.\d+',bound.arguments['event_id']): raise ValueError('Event ID must be namespace.number, matching the namespace.')
+            if not bound.arguments['options']: raise ValueError('Add at least one event option.')
+        if function.__name__ in {'set_relations','add_diplomatic_pact'}:
+            if logic.format_tag_clean(bound.arguments['tag'])==logic.format_tag_clean(bound.arguments['target']): raise ValueError('Choose two different countries.')
+        if function.__name__=='set_relations' and not -100<=int(bound.arguments['value'])<=100: raise ValueError('Relations must be between -100 and 100.')
+        if not hasattr(logic,'_operation_lock'): logic._operation_lock=threading.RLock()
+        with logic._operation_lock:
+            if getattr(logic,'_operation_depth',0): return function(self,*args,**kwargs)
+            root=Path(logic.mod_path)
+            def files(): return {p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in {'.txt','.yml','.json'} and not p.is_symlink()}
+            before={p:p.read_bytes() for p in files()}
+            logic._operation_depth=1; logic._backup_done=False
+            original_log=logic.log; errors=[]
+            def record(message,level='info'):
+                if level=='error': errors.append(str(message))
+                original_log(message,level)
+            logic.log=record
+            try:
+                logic.perform_auto_backup()
+                result=function(self,*args,**kwargs)
+                if errors: raise ValueError('\n'.join(errors))
+                for path in files():
+                    raw=path.read_bytes()
+                    if before.get(path)==raw: continue
+                    text=raw.decode('utf-8-sig')
+                    if path.suffix=='.txt': script_blocks(text)
+                    elif path.suffix=='.json': json.loads(text)
+                    elif path.suffix=='.yml':
+                        if not raw.startswith(b'\xef\xbb\xbf'): raise ValueError(f'{path.name}: localization needs UTF-8 BOM.')
+                        for line in text.splitlines():
+                            if re.match(r'^\s+[^\s:]+:\d*\s',line):
+                                value=re.split(r':\d*\s*',line,maxsplit=1)[1]
+                                tokens=list(script_tokens(value))
+                                if len(tokens)!=1 or not tokens[0][0].startswith('"'): raise ValueError(f'{path.name}: malformed localization value.')
+                return result
+            except Exception:
+                for path in files()-before.keys(): path.unlink()
+                for path,raw in before.items():
+                    if not path.exists() or path.read_bytes()!=raw:
+                        path.parent.mkdir(parents=True,exist_ok=True); path.write_bytes(raw)
+                logic.state_manager.load_state_regions()
+                original_log('Edit failed; text files were restored to their previous contents.','warn')
+                raise
+            finally:
+                logic.log=original_log; logic._operation_depth=0; logic._backup_done=False
+    return run
+
+def culture_suggestions(combo, choices, accept):
+    """Show prefix matches while keeping keyboard focus in the editable field."""
+    popup = None
+    def close(event=None):
+        nonlocal popup
+        if popup is not None:
+            popup.destroy()
+            popup = None
+    def update(event):
+        if event.keysym in ('Down','Up','Return','Escape','Tab','Shift_L','Shift_R'):
+            return
+        close()
+        prefix = combo.get().strip().casefold()
+        matches = [v for v in choices if v.casefold().startswith(prefix)]
+        combo.configure(values=matches)
+        if not prefix or not matches:
+            return
+        nonlocal popup
+        popup = tk.Toplevel(combo)
+        popup.overrideredirect(True)
+        popup.transient(combo.winfo_toplevel())
+        popup.geometry(f"{combo.winfo_width()}x{min(7,len(matches))*24}+{combo.winfo_rootx()}+{combo.winfo_rooty()+combo.winfo_height()}")
+        listing = tk.Listbox(popup, exportselection=False, bg='#473a2b', fg='#f3e7ce')
+        listing.pack(fill='both',expand=True)
+        for value in matches:
+            listing.insert('end',value)
+        def choose(click):
+            combo.set(matches[listing.nearest(click.y)])
+            close()
+            accept(None)
+        listing.bind('<ButtonPress-1>',choose)
+    combo.bind('<KeyRelease>',update)
+    combo.bind('<FocusOut>',close,add='+')
+    combo.bind('<Escape>',close,add='+')
+    combo.bind('<Down>',close,add='+')
+    combo.bind('<ButtonPress-1>',close,add='+')
+
 class Vic3Logic:
-    CAT_A_STATE = ["building_government_administration", "building_construction_sector", "building_university", "building_barrack", "building_port", "building_conscription_center"]
+    def effective_files(self, relative):
+        """Same relative mod filename shadows vanilla, then files load in sorted order."""
+        paths = {}
+        roots = ([Path(self.vanilla_path)/'game'] if self.vanilla_path else []) + ([Path(self.mod_path)] if self.mod_path else [])
+        for root in roots:
+            folder = root / relative
+            if folder.is_dir():
+                for path in sorted(folder.rglob('*.txt')):
+                    paths[path.relative_to(folder).as_posix()] = path
+        return [paths[k] for k in sorted(paths)]
+
+    def definition_keys(self, relative):
+        result = set()
+        for path in self.effective_files(relative):
+            result.update(b['key'] for b in script_blocks(path.read_text(encoding='utf-8-sig'), depth=0) if b['key'])
+        return sorted(result)
+
+    def _require_mod(self):
+        if not self.mod_path or not Path(self.mod_path).is_dir(): raise ValueError('Select a mod folder first.')
+
+    @mod_operation
+    def _write_formation(self, tag, name, state, units, fleet=False):
+        self._require_mod()
+        tag = identifier(self.format_tag_clean(tag), 'Country tag')
+        if not name.strip(): raise ValueError('A formation name is required.')
+        units = {identifier(k): nonnegative(v) for k,v in units.items()}
+        if not sum(units.values()): raise ValueError('Add at least one unit or ship.')
+        final_state, region = self._get_location_data(tag, state)
+        if not final_state: raise ValueError('Could not resolve a valid state and strategic region.')
+        database = 'common/ship_types' if fleet else 'common/combat_unit_types'
+        known = self.definition_keys(database)
+        if not known: raise ValueError(f'Load current game files first: {database} is unavailable.')
+        for key, count in units.items():
+            if count and key not in known: raise ValueError(f'{key} is absent from the selected game/mod definitions.')
+        kind = 'fleet' if fleet else 'army'
+        uid = uuid.uuid4().hex[:12]
+        lines = []
+        for key, count in units.items():
+            if not count: continue
+            if fleet:
+                lines.append(f'            ship = {{ type = ship_type:{key} count = {count} }}')
+            else:
+                lines.append(f'            combat_unit = {{ type = unit_type:{key} state_region = s:{final_state} count = {count} }}')
+        text = ('MILITARY_FORMATIONS = {\n    c:'+tag+' ?= {\n        create_military_formation = {\n'
+                +f'            name = {quoted(name)}\n            type = {kind}\n            hq_region = {region}\n'
+                +f'            save_scope_as = v3mt_{kind}_{tag.lower()}_{uid}\n'+'\n'.join(lines)+'\n        }\n    }\n}\n')
+        self.perform_auto_backup()
+        path = Path(self.mod_path)/'common/history/military_formations'/f'99_v3mt_{kind}_{tag.lower()}_{uid}.txt'
+        atomic_text(path, text)
+        self.log(f'[SUCCESS] Created {kind}: {name}', 'success')
+        return str(path)
+
+    def _formation_snapshot(self, data):
+        path = Path(data['file']).resolve()
+        if not path.is_relative_to(Path(self.mod_path).resolve()): raise ValueError('Only mod files can be edited.')
+        content = path.read_text(encoding='utf-8-sig')
+        if hashlib.sha256(content.encode()).hexdigest() != data['fingerprint']:
+            raise ValueError('This file changed since loading. Reload formations before editing.')
+        return path, content
+
+    def _localize(self, filename, entries):
+        path=Path(self.mod_path)/'localization/english'/f'{filename}_l_english.yml'
+        text=path.read_text(encoding='utf-8-sig') if path.exists() else 'l_english:\n'
+        for key,value in entries.items():
+            line=f' {key}:0 {quoted(value)}'
+            pattern=r'^\s*'+re.escape(key)+r':[^\n]*$'
+            if re.search(pattern,text,re.M): text=re.sub(pattern,lambda m:line,text,flags=re.M)
+            else: text=text.rstrip()+'\n'+line+'\n'
+        atomic_text(path,text,localization=True)
+
+    def validate_mod(self):
+        self._require_mod()
+        issues=[]
+        root=Path(self.mod_path)
+        def add(level,path,message): issues.append(dict(level=level,file=str(path.relative_to(root)),message=message))
+        metadata=root/'.metadata/metadata.json'
+        try:
+            meta=json.loads(metadata.read_text(encoding='utf-8-sig'))
+            if not meta.get('name'): add('error',metadata,'Missing mod name.')
+            if not meta.get('supported_game_version'): add('warn',metadata,'Supported game version is unspecified.')
+        except (OSError,ValueError) as exc: add('error',metadata,f'Metadata cannot be read: {exc}')
+        if (root/'game').exists(): add('error',root/'game','Mod contents belong at the root, without a game/ wrapper.')
+        if (root/'map/data').exists(): add('error',root/'map/data','Use map_data/ for Victoria 3 map files.')
+        wrappers={'states':'STATES','countries':'COUNTRIES','pops':'POPS','population':'POPULATION','buildings':'BUILDINGS','military_formations':'MILITARY_FORMATIONS','diplomacy':'DIPLOMACY','power_blocs':'POWER_BLOCS'}
+        known_ships=set(self.definition_keys('common/ship_types'))
+        known_regions=set(self.definition_keys('common/strategic_regions'))
+        for path in sorted(root.rglob('*.txt')):
+            rel=path.relative_to(root)
+            if rel.parts[0] not in ('common','events','map_data'): continue
+            try:
+                text=path.read_text(encoding='utf-8-sig'); blocks=script_blocks(text)
+            except (OSError,ValueError) as exc:
+                add('error',path,str(exc)); continue
+            if len(rel.parts)>3 and rel.parts[:2]==('common','history') and rel.parts[2] in wrappers:
+                expected=wrappers[rel.parts[2]]
+                has_wrapper = any(b['key'] == expected and b['depth'] == 0 for b in blocks)
+                if not has_wrapper and next(script_tokens(text), None) is not None:
+                    # Some shipped auxiliary files use a different top-level structure.
+                    original = Path(self.vanilla_path) / 'game' / rel if self.vanilla_path else None
+                    try:
+                        unchanged = original is not None and original.read_text(encoding='utf-8-sig') == text
+                    except (OSError, UnicodeError):
+                        unchanged = False
+                    if not unchanged:
+                        add('error', path, f'Missing {expected} history wrapper.')
+            for b in blocks:
+                body=text[b['opening']+1:b['end']-1]
+                if b['key']=='create_military_formation':
+                    typ=field(body,'type'); hq=field(body,'hq_region').removeprefix('sr:')
+                    if known_regions and hq not in known_regions: add('error',path,f'Unknown HQ: {hq}')
+                    if typ=='fleet' and script_blocks(body,'combat_unit',0): add('error',path,'Legacy naval combat_unit entries: migrate manually to 1.13 ship entries.')
+                    for unit in script_blocks(body,'ship',0):
+                        key=field(body[unit['opening']+1:unit['end']-1],'type').removeprefix('ship_type:')
+                        if known_ships and key not in known_ships: add('error',path,f'Unknown ship type: {key}')
+                if b['key']=='create_power_bloc' and not field(body,'principle'): add('error',path,'Power bloc is missing a primary principle.')
+            # Check retired identifiers as tokens, not comments or localization strings.
+            deprecated={'has_role','is_ruler','is_heir','should_be_pinned_by_default'}
+            for token,_,_ in script_tokens(text):
+                if token in deprecated: add('warn',path,f'Review pre-1.13 field: {token}')
+        ids,provinces={},{}
+        for path in self.effective_files('map_data/state_regions'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,depth=0):
+                if not b['key'] or not b['key'].startswith('STATE_'): continue
+                body=text[b['opening']+1:b['end']-1]; number=field(body,'id')
+                if number in ids and ids[number]!=b['key']: issues.append(dict(level='error',file=str(path),message=f'Duplicate state ID {number}: {ids[number]}, {b["key"]}'))
+                ids[number]=b['key']
+                for pb in script_blocks(body,'provinces',0):
+                    for value,_,_ in script_tokens(body[pb['opening']+1:pb['end']-1]):
+                        value=value.strip('"').lower()
+                        if value in provinces and provinces[value]!=b['key']: issues.append(dict(level='error',file=str(path),message=f'Province {value} belongs to multiple states.'))
+                        provinces[value]=b['key']
+        for path in sorted((root/'localization').rglob('*.yml')) if (root/'localization').exists() else []:
+            raw=path.read_bytes()
+            if not raw.startswith(b'\xef\xbb\xbf'): add('error',path,'Localization must be UTF-8 with BOM.')
+            text=raw.decode('utf-8-sig')
+            if not re.search(r'^l_[a-z_]+:\s*$',text,re.M): add('error',path,'Missing language header.')
+            if not re.search(r'_l_[a-z_]+\.yml$',path.name): add('error',path,'Filename needs _l_<language>.yml suffix.')
+            seen=set()
+            for match in re.finditer(r'^\s+([^\s:]+):',text,re.M):
+                if match[1] in seen: add('warn',path,f'Duplicate localization key: {match[1]}')
+                seen.add(match[1])
+        return issues
+
+    def _editable_copy(self, source):
+        self._require_mod(); source=Path(source).resolve(); mod=Path(self.mod_path).resolve()
+        if source.is_relative_to(mod): return source
+        game=(Path(self.vanilla_path)/'game').resolve() if self.vanilla_path else None
+        if not game or not source.is_relative_to(game): raise ValueError('File is outside the game and mod folders.')
+        target=mod/source.relative_to(game)
+        if not target.exists():
+            target.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(source,target)
+        return target
+
+    CAT_A_STATE = ["building_government_administration", "building_construction_sector", "building_university", "building_barrack", "building_port", "building_conscription_center", "building_naval_base", "building_naval_administration"]
     CAT_B_RURAL = ["building_wheat_farm", "building_rye_farm", "building_rice_farm", "building_maize_farm", "building_millet_farm", "building_livestock_ranch", "building_logging_camp", "building_rubber_plantation", "building_cotton_plantation", "building_coffee_plantation", "building_tea_plantation", "building_tobacco_plantation", "building_sugar_plantation", "building_vineyard", "building_fruit_plantation", "building_silk_plantation", "building_dye_plantation", "building_opium_plantation", "building_fishing_wharf", "building_whaling_station"]
 
     def __init__(self, log_callback):
         self.log = log_callback
         self.mod_path = ""
         self.vanilla_path = ""
-        self.auto_backup_enabled = False
+        self.auto_backup_enabled = True
         self.stop_event = threading.Event()
         self.state_manager = StateManager(self)
 
     def set_mod_path(self, path):
-        self.mod_path = path
+        target = Path(path).expanduser().resolve()
+        if not target.is_dir(): raise ValueError('Select an existing mod folder.')
+        if (target / 'binaries').is_dir() or (target / 'launcher').is_dir() or (target / 'game' / 'common').is_dir():
+            raise ValueError('This is a game installation, not a mod folder.')
+        if self.vanilla_path and target.is_relative_to(Path(self.vanilla_path).resolve()):
+            raise ValueError('The mod folder must be outside the game installation.')
+        self.mod_path = str(target)
         self.state_manager.load_state_regions()
 
     def set_vanilla_path(self, path):
-        self.vanilla_path = self.normalize_vanilla_path(path)
+        selected = Path(path).expanduser().resolve()
+        game = selected / 'game' if (selected / 'game' / 'common').is_dir() else selected
+        if not (game / 'common').is_dir(): raise ValueError('Select the Victoria 3 installation or its game folder.')
+        if self.mod_path and Path(self.mod_path).resolve().is_relative_to(game):
+            raise ValueError('The mod folder must be outside the game installation.')
+        # Existing readers consistently append game/; retain this internal convention.
+        if game.name != 'game': raise ValueError('The selected game data folder must be named game.')
+        self.vanilla_path = str(game.parent)
         self.state_manager.load_state_regions()
 
-    def normalize_vanilla_path(self, path):
-        """Accept either the Victoria 3 root folder or the game subfolder and normalize to the root."""
-        if not path:
-            return ""
-
-        norm = os.path.normpath(path)
-        if os.path.basename(norm).lower() == "game":
-            parent = os.path.dirname(norm)
-            if os.path.isdir(os.path.join(norm, "common")) or os.path.isdir(os.path.join(norm, "map")) or os.path.isdir(os.path.join(norm, "map_data")):
-                return parent
-
-        return norm
-
-    def get_effective_vanilla_path(self):
-        """Returns a usable Victoria 3 install root, auto-detecting it when possible."""
-        normalized = self.normalize_vanilla_path(self.vanilla_path)
-        if normalized and os.path.exists(os.path.join(normalized, "game")):
-            self.vanilla_path = normalized
-            return normalized
-
-        detected = self.auto_detect_vanilla_path()
-        if detected:
-            self.vanilla_path = detected
-            return detected
-
-        return ""
-
-    def auto_detect_vanilla_path(self):
-        """Best-effort auto-detection of the Victoria 3 install root."""
-        candidates = []
-
-        # Common direct install locations.
-        for env_name in ("PROGRAMFILES(X86)", "PROGRAMFILES"):
-            base = os.environ.get(env_name)
-            if base:
-                steam_base = os.path.join(base, "Steam")
-                candidates.append(os.path.join(steam_base, "steamapps", "common", "Victoria 3"))
-
-        # Steam registry install path on Windows.
-        if os.name == "nt":
-            try:
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
-                    steam_path, _ = winreg.QueryValueEx(key, "SteamPath")
-                    if steam_path:
-                        candidates.append(os.path.join(steam_path, "steamapps", "common", "Victoria 3"))
-
-                        library_vdf = os.path.join(steam_path, "steamapps", "libraryfolders.vdf")
-                        if os.path.exists(library_vdf):
-                            try:
-                                with open(library_vdf, "r", encoding="utf-8", errors="ignore") as f:
-                                    vdf_content = f.read()
-                                for lib_path in re.findall(r'"path"\s+"([^"]+)"', vdf_content):
-                                    lib_path = lib_path.replace('\\\\', '\\')
-                                    candidates.append(os.path.join(lib_path, "steamapps", "common", "Victoria 3"))
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-
-        # Return the first valid root we can confirm.
-        seen = set()
-        for candidate in candidates:
-            norm = self.normalize_vanilla_path(candidate)
-            if not norm or norm in seen:
-                continue
-            seen.add(norm)
-
-            if os.path.exists(os.path.join(norm, "game", "common", "country_definitions")):
-                return norm
-
-        return ""
-
     def safe_str(self, s):
-        if not s: return ""
-        return s.replace('"', '\\"')
+        return quoted(s or '')[1:-1]
 
     def format_tag_clean(self, user_input):
         cleaned = user_input.strip()
@@ -290,264 +490,98 @@ class Vic3Logic:
 
     # --- TAG VALIDATION & CREATION ---
     def tag_exists(self, tag):
-        """Checks if a country tag already exists in common/country_definitions."""
-        def_path = os.path.join(self.mod_path, "common/country_definitions")
-        if not os.path.exists(def_path): return False
-        
-        for root, _, files in os.walk(def_path):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                try:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-                
-                if re.search(r"^\s*" + re.escape(tag) + r"\s*=", content, re.MULTILINE):
-                    return True
-        return False
-
-    def _parse_vic3_color_value(self, block):
-        """Parses a Vic3 color line from a block and returns (r, g, b) or None."""
-        c_match = re.search(
-            r"\bcolor\b\s*=\s*(hsv360|hsv|rgb)?\s*\{\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\}",
-            block,
-            re.IGNORECASE
-        )
-        if not c_match:
-            return None
-
-        c_type = (c_match.group(1) or "").lower()
-        v1 = float(c_match.group(2))
-        v2 = float(c_match.group(3))
-        v3 = float(c_match.group(4))
-
-        if c_type == "hsv360":
-            h = (v1 % 360.0) / 360.0
-            s = v2 / 100.0 if v2 > 1.0 else v2
-            v = v3 / 100.0 if v3 > 1.0 else v3
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
-            return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
-
-        if c_type == "hsv":
-            h = v1 if v1 <= 1.0 else (v1 % 360.0) / 360.0
-            s = v2 / 100.0 if v2 > 1.0 else v2
-            v = v3 / 100.0 if v3 > 1.0 else v3
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
-            return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
-
-        # RGB can be stored either as 0-255 integers or 0-1 floats.
-        if all(0.0 <= val <= 1.0 for val in (v1, v2, v3)) and any(val > 0.0 for val in (v1, v2, v3)):
-            return (
-                int(round(v1 * 255)),
-                int(round(v2 * 255)),
-                int(round(v3 * 255))
-            )
-
-        return (int(round(v1)), int(round(v2)), int(round(v3)))
-
-    def find_country_color(self, tag):
-        """Finds the effective color for a specific tag, with mod files overriding vanilla."""
-        clean_tag = (tag or "").replace("c:", "").strip().upper()
-        if not clean_tag:
-            return None
-
-        effective_vanilla = self.get_effective_vanilla_path()
-
-        paths = []
-        if effective_vanilla:
-            paths.append(os.path.join(effective_vanilla, "game", "common", "country_definitions"))
-        if self.mod_path:
-            paths.append(os.path.join(self.mod_path, "common", "country_definitions"))
-
-        color = None
-        block_pattern = re.compile(
-            rf"(^|\s)(?:c:)?{re.escape(clean_tag)}\s*(?:\?=|=)\s*\{{",
-            re.MULTILINE | re.IGNORECASE
-        )
-
-        # Vanilla first, mod second, so later matches act as overrides.
-        for base_path in paths:
-            if not os.path.exists(base_path):
-                continue
-
-            for root, _, files in os.walk(base_path):
-                for file in files:
-                    if not file.endswith(".txt"):
-                        continue
-
-                    fpath = os.path.join(root, file)
-                    try:
-                        with open(fpath, "r", encoding="utf-8-sig") as f:
-                            content = f.read()
-                    except Exception:
-                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
-
-                    cursor = 0
-                    while True:
-                        m = block_pattern.search(content, cursor)
-                        if not m:
-                            break
-
-                        start_idx = m.end() - 1
-                        _, end_idx = self.find_block_content(content, start_idx)
-                        if not end_idx:
-                            cursor = m.end()
-                            continue
-
-                        block = content[start_idx:end_idx]
-                        parsed = self._parse_vic3_color_value(block)
-                        if parsed is not None:
-                            color = parsed
-
-                        cursor = end_idx
-
-        return color
+        return self.format_tag_clean(tag) in self.definition_keys('common/country_definitions')
 
     def scan_all_country_colors(self):
         """Scans both mod and vanilla for country colors. Returns {tag: (r,g,b)}."""
         colors = {}
-        effective_vanilla = self.get_effective_vanilla_path()
-
         paths = []
-        if effective_vanilla:
-            paths.append(os.path.join(effective_vanilla, "game", "common", "country_definitions"))
-        if self.mod_path:
-            paths.append(os.path.join(self.mod_path, "common", "country_definitions"))
+        if self.mod_path: paths.append(os.path.join(self.mod_path, "common/country_definitions"))
+        if self.vanilla_path: paths.append(os.path.join(self.vanilla_path, "game/common/country_definitions"))
 
-        skip_blocks = {
-            "AGENTS", "TIERS", "TYPES", "CULTURES", "RELIGIONS",
-            "COUNTRIES", "COUNTRY_DEFINITIONS", "DYNAMIC_COUNTRIES"
-        }
-
-        block_pattern = re.compile(
-            r"^\s*(?:c:)?([A-Z][A-Z0-9_]{1,4})\s*(?:\?=|=)\s*\{",
-            re.MULTILINE
-        )
-
-        for base_path in paths:
-            if not os.path.exists(base_path):
-                continue
-
-            for root, _, files in os.walk(base_path):
+        for p in paths:
+            if not os.path.exists(p): continue
+            for root, _, files in os.walk(p):
                 for file in files:
-                    if not file.endswith(".txt"):
-                        continue
-
-                    fpath = os.path.join(root, file)
+                    if not file.endswith(".txt"): continue
                     try:
-                        with open(fpath, "r", encoding="utf-8-sig") as f:
-                            content = f.read()
-                    except Exception:
-                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                            content = f.read()
+                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
+                    except:
+                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
 
+                    # Find tags and colors
+                    # c:TAG = { ... color = { r g b } ... }
                     cursor = 0
                     while True:
-                        m = block_pattern.search(content, cursor)
-                        if not m:
-                            break
-
+                        # Find tag definition start
+                        # Matches start of line or space + TAG + space + =
+                        # But more reliably: TAG = {
+                        # Standard paradox syntax: TAG = { ... }
+                        m = re.search(r"(?:^|\s)([A-Za-z0-9_]{3,})\s*=\s*\{", content[cursor:])
+                        if not m: break
                         tag = m.group(1).upper()
-                        if tag in skip_blocks:
-                            cursor = m.end()
-                            continue
+                        if tag in ["AGENTS", "TIERS", "TYPES", "CULTURES", "RELIGIONS"]: # Skip non-country blocks if any
+                             cursor += m.end()
+                             continue
 
-                        start_idx = m.end() - 1
+                        start_idx = cursor + m.end() - 1
                         _, end_idx = self.find_block_content(content, start_idx)
-                        if not end_idx:
-                            cursor = m.end()
-                            continue
 
-                        block = content[start_idx:end_idx]
-                        parsed = self._parse_vic3_color_value(block)
-                        if parsed is not None:
-                            colors[tag] = parsed
+                        if end_idx:
+                            block = content[start_idx:end_idx]
+                            # Look for color
+                            # color = { r g b } or color = rgb { r g b } or color = hsv { ... } or color = hsv360 { ... }
+                            c_match = re.search(r"color\s*=\s*(hsv360|hsv|rgb)?\s*\{\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\}", block, re.IGNORECASE)
+                            if c_match:
+                                c_type = c_match.group(1)
+                                v1, v2, v3 = float(c_match.group(2)), float(c_match.group(3)), float(c_match.group(4))
+                                rgb = (0,0,0)
+                                if c_type and c_type.lower() == 'hsv360':
+                                    h = v1 / 360.0
+                                    s = v2 / 100.0
+                                    v = v3 / 100.0
+                                    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+                                    rgb = (int(r * 255), int(g * 255), int(b * 255))
+                                elif c_type and c_type.lower() == 'hsv':
+                                    h = v1 if v1 <= 1.0 else v1/360.0
+                                    s = v2 if v2 <= 1.0 else v2/100.0
+                                    v = v3 if v3 <= 1.0 else v3/100.0
+                                    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+                                    rgb = (int(r * 255), int(g * 255), int(b * 255))
+                                else:
+                                    # rgb 0-255 or 0-1
+                                    if v1 <= 1.0 and v2 <= 1.0 and v3 <= 1.0 and (v1 > 0 or v2 > 0 or v3 > 0):
+                                         rgb = (int(v1*255), int(v2*255), int(v3*255))
+                                    else:
+                                         rgb = (int(v1), int(v2), int(v3))
 
-                        cursor = end_idx
+                                # Mod overrides vanilla
+                                if tag not in colors or p.startswith(self.mod_path):
+                                    colors[tag] = rgb
 
+                            cursor = end_idx
+                        else:
+                            cursor += m.end()
         return colors
 
     def scan_definitions_for_options(self):
-        """Scans common/country_definitions for unique cultures, religions, tiers, and country types."""
-        def_path = os.path.join(self.mod_path, "common/country_definitions")
-
-        cultures = set()
-        religions = set()
-        tiers = set()
-        types = set()
-
-        if not os.path.exists(def_path):
-            return [], [], [], []
-
-        for root, _, files in os.walk(def_path):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                try:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                # Cultures
-                cul_matches = re.finditer(r"cultures\s*=\s*\{([^}]+)\}", content)
-                for m in cul_matches:
-                    for c in m.group(1).split():
-                        cultures.add(c.strip())
-
-                # Religions
-                rel_matches = re.finditer(r"religion\s*=\s*([A-Za-z0-9_]+)", content)
-                for m in rel_matches:
-                    r_val = m.group(1).strip()
-                    if r_val.lower() != "technically":
-                        religions.add(r_val)
-
-                # Tiers
-                tier_matches = re.finditer(r"tier\s*=\s*([A-Za-z0-9_]+)", content)
-                for m in tier_matches:
-                    tiers.add(m.group(1).strip())
-
-                # Country Types
-                type_matches = re.finditer(r"country_type\s*=\s*([A-Za-z0-9_]+)", content)
-                for m in type_matches:
-                    types.add(m.group(1).strip())
-
-        return sorted(list(cultures)), sorted(list(religions)), sorted(list(tiers)), sorted(list(types))
+        tiers,types=set(),set()
+        for path in self.effective_files('common/country_definitions'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,depth=0):
+                body=text[b['opening']+1:b['end']-1]
+                if field(body,'tier'): tiers.add(field(body,'tier'))
+                if field(body,'country_type'): types.add(field(body,'country_type'))
+        return self.definition_keys('common/cultures'),self.definition_keys('common/religions'),sorted(tiers),sorted(types)
 
     def get_country_data(self, tag):
-        """Attempts to find culture, religion, and capital of a tag."""
-        data = { "cultures": None, "religion": None, "capital": None }
-        
-        def_path = os.path.join(self.mod_path, "common/country_definitions")
-        if not os.path.exists(def_path): return data
-
-        clean_tag = tag.replace("c:", "").strip()
-        
-        for root, _, files in os.walk(def_path):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                try:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                match = re.search(r"(^|\s)" + re.escape(clean_tag) + r"\s*=\s*\{", content, re.MULTILINE | re.IGNORECASE)
-                if match:
-                    start_brace = match.end() - 1
-                    _, end_brace = self.find_block_content(content, start_brace)
-                    
-                    if end_brace:
-                        block_content = content[start_brace:end_brace]
-                        
-                        cul_match = re.search(r"cultures\s*=\s*\{([^}]+)\}", block_content)
-                        if cul_match: data["cultures"] = cul_match.group(1).strip()
-                        
-                        rel_match = re.search(r"religion\s*=\s*([A-Za-z0-9_]+)", block_content)
-                        if rel_match: data["religion"] = rel_match.group(1).strip()
-
-                        # Matches capital = ... or capital_state = ...
-                        cap_match = re.search(r"(capital|capital_state)\s*=\s*([A-Za-z0-9_]+)", block_content)
-                        if cap_match: data["capital"] = cap_match.group(2).strip()
-                        return data
+        data=dict(cultures=None,religion=None,capital=None)
+        for path in self.effective_files('common/country_definitions'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,self.format_tag_clean(tag),0):
+                body=text[b['opening']+1:b['end']-1]
+                cultures=[t.strip('"') for cb in script_blocks(body,'cultures',0) for t,_,_ in script_tokens(body[cb['opening']+1:cb['end']-1])]
+                data=dict(cultures=' '.join(cultures),religion=field(body,'religion') or None,capital=field(body,'capital') or None)
         return data
 
     def get_capital_hq(self, tag):
@@ -690,6 +724,7 @@ class Vic3Logic:
 
         return settings
 
+    @mod_operation
     def save_pop_history_settings(self, tag, wealth, literacy):
         self.perform_auto_backup()
         clean_tag = tag.replace("c:", "").strip()
@@ -833,72 +868,6 @@ class Vic3Logic:
         if not found_any: return None
         return data
 
-    def ensure_country_history_exists(self, new_tag, donor_tag, target_states=None):
-        hist_dir = os.path.join(self.mod_path, "common/history/countries")
-        clean_new = new_tag.replace("c:", "").strip().upper()
-
-        # Check if file exists
-        if os.path.exists(hist_dir):
-            for root, _, files in os.walk(hist_dir):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                    if re.search(r"(?:^|\s)c:" + re.escape(clean_new) + r"(\?=|:|=)", content):
-                        return # Exists
-
-        self.log(f"[INFO] History file for {clean_new} missing. Creating from {donor_tag}...", 'info')
-
-        ext_data = self.get_extended_history_data(donor_tag)
-        if not ext_data:
-            # Safe defaults if no donor
-            has_railway = False
-            if target_states:
-                # Check for railways in target states to add technology
-                for s in target_states:
-                    bldgs = self.scan_state_buildings(s)
-                    for b in bldgs:
-                        if b['type'] == "building_railway":
-                            has_railway = True
-                            break
-                    if has_railway: break
-
-            lines = [
-                "effect_starting_technology_tier_2_tech = yes",
-                "effect_starting_politics_conservative = yes"
-            ]
-            if has_railway:
-                lines.append("add_technology_researched = railways")
-
-            # Note: We don't add default laws to keep it clean as requested, assuming politics effect handles basic setup or game defaults
-        else:
-            lines = []
-            if ext_data.get("tech_tier"): lines.extend(ext_data["tech_tier"])
-            else: lines.append("effect_starting_technology_tier_1_tech = yes")
-
-            if ext_data.get("politics"): lines.extend(ext_data["politics"])
-            if ext_data.get("techs_researched"): lines.extend(ext_data["techs_researched"])
-            if ext_data.get("laws"): lines.extend(sorted(list(set(ext_data["laws"]))))
-            if ext_data.get("institutions"): lines.extend(ext_data["institutions"])
-            lines.append("set_tax_level = medium")
-
-        # Name
-        name, _ = self.load_country_localization(clean_new)
-        if not name: name = clean_new.lower()
-        filename = f"{clean_new} - {name}.txt"
-
-        os.makedirs(hist_dir, exist_ok=True)
-        filepath = os.path.join(hist_dir, filename)
-
-        body = "\n\t\t".join(lines)
-        content = f"COUNTRIES = {{\n\tc:{clean_new} ?= {{\n\t\t{body}\n\t}}\n}}"
-
-        with open(filepath, 'w', encoding='utf-8-sig') as f: f.write(content)
-        self.log(f"[SUCCESS] Created history file: {filename}", 'success')
-
     def get_nearest_vic3_color(self, rgb):
         colors = {
             "white": (255, 255, 255), "black": (10, 10, 10), "red": (180, 0, 0),
@@ -918,6 +887,7 @@ class Vic3Logic:
                 closest_name = name
         return closest_name
 
+    @mod_operation
     def create_country_files(self, tag, name, adjective, capital, color_rgb, cultures_list, religion, tier, country_type, old_tag, wealth=None, literacy=None):
         self.perform_auto_backup()
         self.log(f"[GEN] Creating core files for {tag} ({name})...")
@@ -947,16 +917,16 @@ class Vic3Logic:
         os.makedirs(loc_dir, exist_ok=True)
         loc_file = os.path.join(loc_dir, f"auto_{tag.lower()}_l_english.yml")
         loc_content = f"""l_english:
- {tag}: "{name}"
- {tag}_ADJ: "{adjective}"
- {tag}_DEF: "{name}"
+ {tag}:0 "{self.safe_str(name)}"
+ {tag}_ADJ:0 "{self.safe_str(adjective)}"
+ {tag}_DEF:0 "{self.safe_str(name)}"
 """
         with open(loc_file, 'w', encoding='utf-8-sig') as f: f.write(loc_content)
 
         # History
         hist_dir = os.path.join(self.mod_path, "common/history/countries")
         os.makedirs(hist_dir, exist_ok=True)
-        hist_file = os.path.join(hist_dir, f"{tag} - {name}.txt")
+        hist_file = os.path.join(hist_dir, f"{tag} - v3mt.txt")
 
         # Extended Data Extraction
         ext_data = self.get_extended_history_data(old_tag)
@@ -1024,7 +994,7 @@ class Vic3Logic:
         # Population History
         pop_dir = os.path.join(self.mod_path, "common/history/population")
         os.makedirs(pop_dir, exist_ok=True)
-        pop_file = os.path.join(pop_dir, f"{tag} - {name}.txt")
+        pop_file = os.path.join(pop_dir, f"{tag} - v3mt.txt")
 
         if wealth or literacy:
             # Use provided settings
@@ -1064,269 +1034,65 @@ class Vic3Logic:
         with open(flag_file, 'w', encoding='utf-8-sig') as f: f.write(flag_content)
 
     def _get_location_data(self, tag, target_state):
-        owned_states = self.get_all_owned_states(tag)
-        final_state = None
-        if target_state and target_state in owned_states:
-            final_state = target_state
-            self.log(f"   [LOC] Validated location: {final_state}")
-        else:
-            if target_state: self.log(f"   [WARN] {tag} does not own {target_state}. Falling back to capital.", 'warn')
-            data = self.get_country_data(tag)
-            if data["capital"]:
-                final_state = data["capital"]
-                self.log(f"   [LOC] Using Capital: {final_state}")
-            else:
-                return None, None
-        
-        hq_region = self.find_strategic_region(f"s:{final_state}")
-        if not hq_region:
-            hq_region = "sr:region_europe"
-            self.log(f"   [WARN] Could not find HQ region. Defaulting to Europe.", 'warn')
-        else:
-            if not hq_region.startswith("sr:"):
-                hq_region = f"sr:{hq_region}"
-                
-        return final_state, hq_region
+        owned = set(self.get_all_owned_states(tag))
+        state = self.normalize_state_key(target_state) if target_state else self.get_country_data(tag).get('capital')
+        if not state or state not in owned: raise ValueError('Choose a state owned by this country (or leave blank for its owned capital).')
+        region = self.find_strategic_region(state)
+        if not region: raise ValueError(f'No strategic region contains {state}; load current game definitions.')
+        return state, 'sr:'+region.removeprefix('sr:')
 
+    @mod_operation
     def create_army_file(self, tag, army_name, target_state, inf, art, cav):
-        """Creates a new army history file."""
-        self.perform_auto_backup()
-        self.log(f"[GEN] Creating Army '{army_name}' for {tag}...")
-        final_state, hq_region = self._get_location_data(tag, target_state)
-        if not final_state: return self.log("[ERROR] Aborting: Location unknown.", 'error')
+        return self._write_formation(tag, army_name, target_state, dict(combat_unit_type_line_infantry=inf, combat_unit_type_cannon_artillery=art, combat_unit_type_hussars=cav))
 
-        units_block = ""
-        # Using state_region and count per the Paradox example
-        if inf > 0:
-            units_block += f"""
-                combat_unit = {{
-                    type = unit_type:combat_unit_type_line_infantry
-                    state_region = s:{final_state}
-                    count = {inf}
-                }}"""
-        if art > 0:
-            units_block += f"""
-                combat_unit = {{
-                    type = unit_type:combat_unit_type_cannon_artillery
-                    state_region = s:{final_state}
-                    count = {art}
-                }}"""
-        if cav > 0:
-            units_block += f"""
-                combat_unit = {{
-                    type = unit_type:combat_unit_type_hussars
-                    state_region = s:{final_state}
-                    count = {cav}
-                }}"""
-
-        mil_dir = os.path.join(self.mod_path, "common/history/military_formations")
-        os.makedirs(mil_dir, exist_ok=True)
-        safe_name = army_name.lower().replace(" ", "_")
-        mil_file = os.path.join(mil_dir, f"99_auto_army_{tag.lower()}_{safe_name}.txt")
-
-        # Wrapper MILITARY_FORMATIONS added with ?=
-        content = f"""MILITARY_FORMATIONS = {{
-    c:{tag} ?= {{
-        create_military_formation = {{
-            name = "{army_name}"
-            type = army
-            hq_region = {hq_region}
-            {units_block}
-        }}
-    }}
-}}
-"""
-        with open(mil_file, 'w', encoding='utf-8-sig') as f: f.write(content)
-        self.log(f"   [WRITE] {mil_file}", 'success')
-
+    @mod_operation
     def create_navy_file(self, tag, navy_name, target_state, manowar, frigate, ironclad):
-        """Creates a new navy history file."""
-        self.perform_auto_backup()
-        self.log(f"[GEN] Creating Navy '{navy_name}' for {tag}...")
-        self.log(f"   [WARN] Ensure {target_state if target_state else 'Capital'} is a COASTAL state!", 'warn')
-        
-        final_state, hq_region = self._get_location_data(tag, target_state)
-        if not final_state: return self.log("[ERROR] Aborting: Location unknown.", 'error')
-
-        units_block = ""
-        # Using state_region and count
-        if manowar > 0:
-            units_block += f"""
-                combat_unit = {{
-                    type = unit_type:combat_unit_type_man_o_war
-                    state_region = s:{final_state}
-                    count = {manowar}
-                }}"""
-        if frigate > 0:
-            units_block += f"""
-                combat_unit = {{
-                    type = unit_type:combat_unit_type_frigate
-                    state_region = s:{final_state}
-                    count = {frigate}
-                }}"""
-        if ironclad > 0:
-            units_block += f"""
-                combat_unit = {{
-                    type = unit_type:combat_unit_type_ironclad
-                    state_region = s:{final_state}
-                    count = {ironclad}
-                }}"""
-
-        mil_dir = os.path.join(self.mod_path, "common/history/military_formations")
-        os.makedirs(mil_dir, exist_ok=True)
-        safe_name = navy_name.lower().replace(" ", "_")
-        mil_file = os.path.join(mil_dir, f"99_auto_navy_{tag.lower()}_{safe_name}.txt")
-
-        # Wrapper MILITARY_FORMATIONS added with ?=
-        content = f"""MILITARY_FORMATIONS = {{
-    c:{tag} ?= {{
-        create_military_formation = {{
-            name = "{navy_name}"
-            type = fleet
-            hq_region = {hq_region}
-            {units_block}
-        }}
-    }}
-}}
-"""
-        with open(mil_file, 'w', encoding='utf-8-sig') as f: f.write(content)
-        self.log(f"   [WRITE] {mil_file}", 'success')
+        return self._write_formation(tag, navy_name, target_state, dict(ship_type_ship_of_the_line=manowar, ship_type_frigate=frigate, ship_type_ironclad=ironclad), fleet=True)
 
     # --- EXISTING TRANSFER LOGIC ---
     def find_strategic_region(self, state_key):
-        clean_key = state_key.replace("s:", "").upper()
-        
-        paths = []
-        if self.mod_path: paths.append(os.path.join(self.mod_path, "common/strategic_regions"))
-        if self.vanilla_path: paths.append(os.path.join(self.vanilla_path, "game/common/strategic_regions"))
-
-        for path in paths:
-            if not os.path.exists(path): continue
-
-            for root, _, files in os.walk(path):
-                if self.stop_event.is_set(): return None
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f:
-                            content = f.read()
-
-                        # Strip comments to prevent false positives
-                        content_clean = re.sub(r"#.*", "", content)
-
-                        # Simple check first
-                        if clean_key not in content_clean: continue
-
-                        cursor = 0
-                        while True:
-                            # Robust find for region_NAME = {
-                            m = re.search(r"(region_[A-Za-z0-9_]+)\s*=\s*\{", content_clean[cursor:])
-                            if not m: break
-
-                            region_name = m.group(1)
-                            # Find block of region
-                            s_idx, e_idx = self.find_block_content(content_clean, cursor + m.end() - 1)
-
-                            if s_idx:
-                                block = content_clean[s_idx:e_idx]
-                                # Look for states = { ... } inside
-                                s_cursor = 0
-                                while True:
-                                    sm = re.search(r"states\s*=\s*\{", block[s_cursor:])
-                                    if not sm: break
-
-                                    ss_idx, se_idx = self.find_block_content(block, s_cursor + sm.end() - 1)
-                                    if ss_idx:
-                                        states_inner = block[ss_idx+1:se_idx-1]
-                                        if clean_key in states_inner.upper():
-                                            return region_name
-                                        s_cursor = se_idx
-                                    else:
-                                        s_cursor += sm.end()
-
-                                cursor = e_idx
-                            else:
-                                cursor += m.end()
-                    except:
-                        continue
+        state = self.normalize_state_key(state_key)
+        regions = {}
+        for path in self.effective_files('common/strategic_regions'):
+            text = path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text, depth=0):
+                if not b['key']: continue
+                body = text[b['opening']+1:b['end']-1]
+                regions[b['key']] = {t.strip('"').removeprefix('s:') for sb in script_blocks(body, 'states', 0)
+                                     for t,_,_ in script_tokens(body[sb['opening']+1:sb['end']-1])}
+        for key, states in regions.items():
+            if state in states: return key
         return None
 
     def get_states_in_region(self, region_name):
-        """Parses common/strategic_regions to find states in a region."""
-        clean_region = region_name.replace("sr:", "").strip()
-        
-        paths = []
-        if self.mod_path: paths.append(os.path.join(self.mod_path, "common/strategic_regions"))
-        if self.vanilla_path: paths.append(os.path.join(self.vanilla_path, "game/common/strategic_regions"))
-
-        for path in paths:
-            if not os.path.exists(path): continue
-
-            for root, _, files in os.walk(path):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                    # Clean comments
-                    content_clean = re.sub(r"#.*", "", content)
-
-                    m = re.search(r"(^|\s)" + re.escape(clean_region) + r"\s*=\s*\{", content_clean, re.MULTILINE)
-                    if m:
-                        s, e = self.find_block_content(content_clean, m.end() - 1)
-                        if s:
-                            block = content_clean[s:e]
-                            sm = re.search(r"states\s*=\s*\{", block)
-                            if sm:
-                                ss, se = self.find_block_content(block, sm.end() - 1)
-                                if ss:
-                                    states_str = block[ss+1:se-1]
-                                    # Normalize states extracted from file
-                                    return [self.normalize_state_key(s) for s in states_str.split() if s.strip()]
-        return []
+        result = []
+        for path in self.effective_files('common/strategic_regions'):
+            text = path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text, region_name.removeprefix('sr:'), 0):
+                body = text[b['opening']+1:b['end']-1]
+                result = [self.normalize_state_key(t) for sb in script_blocks(body, 'states', 0)
+                          for t,_,_ in script_tokens(body[sb['opening']+1:sb['end']-1])]
+        return result
 
     def find_block_content(self, text, start_index):
-        n = len(text)
-        i = start_index
-        while i < n:
-            if text[i] == '{': break
-            i += 1
-        if i >= n: return None, None
-        
-        start_brace = i
-        i += 1
-        depth = 1
-        in_string = False
-        in_comment = False
-        
-        while i < n and depth > 0:
-            char = text[i]
-            if in_comment:
-                if char == '\n': in_comment = False
-            elif in_string:
-                if char == '"' and text[i-1] != '\\': in_string = False
-            else:
-                if char == '#': in_comment = True
-                elif char == '"': in_string = True
-                elif char == '{': depth += 1
-                elif char == '}': depth -= 1
-            i += 1
-            
-        if depth == 0: return start_brace, i
+        try:
+            tokens = script_tokens(text[start_index:])
+            start, depth = None, 0
+            for token, a, b in tokens:
+                if token == '{':
+                    if start is None: start = start_index+a
+                    depth += 1
+                elif token == '}' and start is not None:
+                    depth -= 1
+                    if depth == 0: return start, start_index+b
+        except ValueError:
+            pass
         return None, None
 
     def get_block_range_safe(self, content, start_pattern, start_search_idx=0):
-        # Updated regex to handle optional comments/whitespace between assignment and block start
-        # Now ensures start_pattern is preceded by boundary or whitespace to prevent partial matches
-        pattern = re.compile(r"(?:^|\s)" + re.escape(start_pattern) + r"\s*(=|[\?]=)(?:(?:\s+)|(?:#[^\n]*\n))*\{", re.IGNORECASE)
-        match = pattern.search(content, start_search_idx)
-        if not match: return None, None
-        
-        start_brace, end_brace = self.find_block_content(content, match.end() - 1)
-        if start_brace is not None:
-            return match.start(), end_brace
+        for block in script_blocks(content):
+            if block['key'] and block['key'].lower() == start_pattern.lower() and block['start'] >= start_search_idx:
+                return block['start'], block['end']
         return None, None
 
     def collect_valid_scopes(self):
@@ -1394,47 +1160,6 @@ class Vic3Logic:
             with open(trade_file, 'w', encoding='utf-8-sig') as f: f.write(content)
             self.log("[TRADE] Cleaned up trade routes.")
 
-    def ensure_railway_tech(self, tag):
-        clean_tag = tag.replace("c:", "").strip()
-        hist_dir = os.path.join(self.mod_path, "common/history/countries")
-
-        target_file = None
-        target_content = None
-
-        # Locate file
-        for root, _, files in os.walk(hist_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                     with open(path, 'r', encoding='utf-8') as f: content = f.read()
-
-                if re.search(r"c:" + re.escape(clean_tag) + r"\b", content):
-                    target_file = path
-                    target_content = content
-                    break
-            if target_file: break
-
-        if target_file:
-            # Check for railway tech
-            # Match "add_technology_researched = railways" or "add_technology = railways"
-            if "railways" not in target_content:
-                 # More precise check?
-                 # Just append to country block
-                 s, e = self.get_block_range_safe(target_content, f"c:{clean_tag}")
-                 if s is not None:
-                     block = target_content[s:e]
-                     if not re.search(r"add_technology(_researched)?\s*=\s*railways", block):
-                         # Insert
-                         lb = block.rfind('}')
-                         new_block = block[:lb] + "\n\t\tadd_technology_researched = railways\n\t}"
-                         target_content = target_content[:s] + new_block + target_content[e:]
-
-                         with open(target_file, 'w', encoding='utf-8-sig') as f: f.write(target_content)
-                         self.log(f"[TECH] Added railways to {clean_tag}")
-
     def prune_orphaned_commanders(self, valid_scopes):
         paths = [
             os.path.join(self.mod_path, "common/history/characters"),
@@ -1475,46 +1200,15 @@ class Vic3Logic:
         if orphans_removed > 0: self.log(f"[SUCCESS] Removed {orphans_removed} orphaned links.", 'success')
 
     def get_all_owned_states(self, tag):
-        states_found = []
-        states_dir = os.path.join(self.mod_path, "common/history/states")
-        if not os.path.exists(states_dir): return []
-        clean_tag = tag.replace("c:", "").strip()
-        for root, _, files in os.walk(states_dir):
-            if self.stop_event.is_set(): return []
-            for file in files:
-                if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
-                state_matches = re.finditer(r"s:(STATE_[A-Za-z0-9_]+)\s*=", content)
-                for match in state_matches:
-                    state_name = match.group(1)
-                    s_start, s_end = self.get_block_range_safe(content, f"s:{state_name}")
-                    if s_start is not None:
-                        block_content = content[s_start:s_end]
-
-                        # Robust check for create_state ownership
-                        cursor = 0
-                        is_owner = False
-                        while True:
-                            cs = re.search(r"create_state\s*=\s*\{", block_content[cursor:])
-                            if not cs: break
-
-                            cs_s, cs_e = self.find_block_content(block_content, cursor + cs.end() - 1)
-                            if cs_s:
-                                cs_inner = block_content[cs_s:cs_e]
-                                if re.search(r"country\s*=\s*c:" + re.escape(clean_tag) + r"\b", cs_inner, re.IGNORECASE):
-                                    is_owner = True
-                                    break
-                                cursor = cs_e
-                            else:
-                                cursor += 1
-
-                        if is_owner:
-                            states_found.append(state_name)
-        return list(set(states_found))
+        tag=self.format_tag_clean(tag);result=set()
+        for path in self.effective_files('common/history/states'):
+            text=path.read_text(encoding='utf-8-sig')
+            for state in script_blocks(text):
+                if not state['key'] or not state['key'].startswith('s:STATE_'): continue
+                body=text[state['opening']+1:state['end']-1]
+                for creation in script_blocks(body,'create_state',0):
+                    if field(body[creation['opening']+1:creation['end']-1],'country').removeprefix('c:')==tag:result.add(state['key'][2:])
+        return sorted(result)
 
     def get_ownership_content(self, building_type, owner_tag, level, state_name):
         """Returns the inner content for an ownership block."""
@@ -1799,7 +1493,7 @@ class Vic3Logic:
                 if not m: break
                 abs_start = cursor + m.start()
                 s, e = self.find_block_content(content, cursor + m.end() - 1)
-                if s:
+                if s is not None:
                     block_inner = content[s:e]
                     c_match = re.search(r"country\s*=\s*c:([A-Za-z0-9_]+)", block_inner)
                     if c_match:
@@ -1843,7 +1537,7 @@ class Vic3Logic:
                 tag = m.group(1)
                 abs_start = cursor + m.start()
                 s, e = self.find_block_content(content, cursor + m.end() - 1)
-                if s:
+                if s is not None:
                     if tag.upper() == clean_old.upper(): old_range = (abs_start, e)
                     elif tag.upper() == clean_new.upper(): new_range = (abs_start, e)
                     cursor = e
@@ -1881,6 +1575,7 @@ class Vic3Logic:
              owners.update(matches)
         return list(owners)
 
+    @mod_operation
     def transfer_ownership_batch(self, state_list, old_owners, new_tag):
         # Auto-backup handled by caller or usually this is part of a larger operation like Create Country
         # If used standalone via "Transfer States", we should backup.
@@ -1948,541 +1643,218 @@ class Vic3Logic:
         cleaned = "\n".join([line for line in cleaned.split('\n') if line.strip()])
         return cleaned
 
-    def generate_immersive_name(self, region_raw, f_type):
-        clean_name = region_raw.lower().replace("region_", "").replace("_", " ").title().strip()
-        return f"\"{f_type.capitalize()} of {clean_name}\""
+    def transferred_names(self, tag):
+        """Allocate names lazily so a file with no transferred units needs no scan."""
+        from collections import Counter
+        used = set()
+        patterns = {'army': Counter(), 'fleet': Counter()}
+        loaded = False
+        fallback = None
+        number_token = re.compile(r'(?<!\w)([0-9]+)(st|nd|rd|th|re|er|ère|ème|e)?(?!\w)|\b([IVXLCDM]+)\b')
+
+        def roman(number):
+            result = ''
+            for value, letters in ((1000,'M'),(900,'CM'),(500,'D'),(400,'CD'),(100,'C'),(90,'XC'),(50,'L'),(40,'XL'),(10,'X'),(9,'IX'),(5,'V'),(4,'IV'),(1,'I')):
+                count, number = divmod(number, value)
+                result += letters * count
+            return result
+
+        def read_examples():
+            localization = {}
+            for path in self.effective_files('common/history/military_formations'):
+                text = path.read_text(encoding='utf-8-sig')
+                for country in script_blocks(text, 'c:'+tag):
+                    body = text[country['opening']+1:country['end']-1]
+                    for form in script_blocks(body, 'create_military_formation', 0):
+                        inner = body[form['opening']+1:form['end']-1]
+                        kind = field(inner, 'type')
+                        name = field(inner, 'name')
+                        if kind not in patterns or not name or name.casefold().startswith('transferred '):
+                            continue
+                        token = script_fields(inner)['name'][0]
+                        if not token.startswith('"') or '_' in name:
+                            if name not in localization:
+                                localization[name] = self.get_loc_text(name)
+                            translated = localization[name]
+                            if translated == name and not token.startswith('"'):
+                                continue
+                            name = translated
+                        if any(c in name for c in '[]$') or '_' in name:
+                            continue
+                        used.add(name.casefold())
+                        match = number_token.search(name)
+                        if match:
+                            prefix, tail = name[:match.start()], name[match.end():]
+                            suffix = match[2] or ''
+                            style = 'roman' if match[3] else 'decimal'
+                            if suffix in ('st','nd','rd','th'):
+                                style, suffix = 'english', ''
+                            elif suffix in ('re','er','ère'):
+                                style = 'french'
+                            width = len(match[1]) if match[1] and match[1].startswith('0') else 0
+                            patterns[kind][(prefix, tail, style, suffix, width)] += 1
+                        else:
+                            patterns[kind][(name+' ', '', 'series', '', 0)] += 1
+
+        def allocate(kind):
+            nonlocal loaded, fallback
+            if not loaded:
+                read_examples()
+                loaded = True
+            examples = patterns.get(kind, {})
+            if examples:
+                prefix, tail, style, suffix, width = max(examples, key=lambda k: (k[2]!='series', examples[k]))
+            else:
+                if fallback is None:
+                    fallback = self.get_loc_text(tag+'_ADJ')
+                    if fallback == tag+'_ADJ' or '$' in fallback:
+                        fallback = tag
+                prefix, tail, style, suffix, width = '', ' '+fallback+(' Fleet' if kind=='fleet' else ' Army'), 'english', '', 0
+            number = 2 if style == 'series' else 1
+            while True:
+                ending = suffix
+                if style == 'english':
+                    ending = 'th' if 10 < number % 100 < 14 else {1:'st',2:'nd',3:'rd'}.get(number % 10,'th')
+                elif style == 'french' and number > 1:
+                    ending = 'e'
+                digits = roman(number) if style in ('roman','series') else str(number).zfill(width)
+                name = prefix + digits + ending + tail
+                if name.casefold() not in used:
+                    used.add(name.casefold())
+                    return name
+                number += 1
+        return allocate
+
+    @mod_operation
+    def rename_transfer_placeholders(self, tag):
+        tag = self.format_tag_clean(tag)
+        allocate = self.transferred_names(tag)
+        edits = {}
+        for form in self.scan_military_formations(tag):
+            if form['name'] in ('Transferred army', 'Transferred fleet', 'Transferred navy'):
+                edits.setdefault(Path(form['file']), []).append((form, allocate(form['type'])))
+        for path, updates in edits.items():
+            text = path.read_text(encoding='utf-8-sig')
+            for form, name in reversed(updates):
+                start, end = form['opening']+1, form['end']-1
+                text = text[:start]+put_field(text[start:end], 'name', quoted(name))+text[end:]
+            atomic_text(path, text)
+        self.log(f"Renamed {sum(map(len, edits.values()))} transferred formations for {tag}.")
 
     def process_military_extraction_multi_pass(self, filepath, old_tag, new_tag, region, state_list, force_move=False, dest_hq_region=None, dest_home_state=None):
-        try:
-            with open(filepath, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
-
-        # Prepare normalized set for fast lookup
-        target_states_norm = set(self.normalize_state_key(s) for s in state_list)
-
-        files_modified = False
-        stolen_units_army = []
-        stolen_units_fleet = []
-        current_search_idx = 0
-        processed_file_parts = []
-        last_idx = 0
-
-        while True:
-            c_start, c_end = None, None
-            found_tag = None
-
-            if old_tag:
-                c_start, c_end = self.get_block_range_safe(content, f"c:{old_tag}", current_search_idx)
-                found_tag = old_tag
-            else:
-                pat = re.compile(r"(?:^|\s)c:([A-Za-z0-9_]+)\s*(\?=|:|=)?\s*\{")
-                m = pat.search(content, current_search_idx)
-                if m:
-                    tag_start = current_search_idx + m.start()
-                    _, c_end_val = self.find_block_content(content, current_search_idx + m.end() - 1)
-                    if c_end_val:
-                        c_start = tag_start
-                        c_end = c_end_val
-                        found_tag = m.group(1)
-
-                        # Check if it's the new_tag, skip
-                        if found_tag.upper() == new_tag.upper():
-                            processed_file_parts.append(content[last_idx:c_end])
-                            last_idx = c_end
-                            current_search_idx = c_end
-                            continue
-
-            if c_start is None:
-                processed_file_parts.append(content[last_idx:])
-                break
-
-            self.log(f"[MIL] Processing country block c:{found_tag} in {os.path.basename(filepath)}")
-            processed_file_parts.append(content[last_idx:c_start])
-
-            # Parse country block body
-            body_start_brace, body_end_brace = self.find_block_content(content, c_start)
-            if body_start_brace is None:
-                # Error parsing block, skip it
-                processed_file_parts.append(content[c_start:c_end])
-                last_idx = c_end
-                current_search_idx = c_end
-                continue
-
-            header = content[c_start:body_start_brace+1]
-            inner_body = content[body_start_brace+1:body_end_brace-1]
-            footer = "}"
-
-            new_inner_parts = []
-            cursor = 0
-
-            while cursor < len(inner_body):
-                # Find create_military_formation
-                match = re.search(r"create_military_formation\s*=\s*\{", inner_body[cursor:])
-                if not match:
-                    new_inner_parts.append(inner_body[cursor:])
-                    break
-
-                abs_match_start = cursor + match.start()
-
-                # Check if commented out
-                substring = inner_body[cursor:abs_match_start]
-                last_newline = substring.rfind('\n')
-                line_prefix = substring[last_newline+1:] if last_newline != -1 else substring
-                if '#' in line_prefix:
-                    # It's commented out, skip this match but preserve text
-                    new_inner_parts.append(inner_body[cursor:abs_match_start + match.end()])
-                    cursor = abs_match_start + match.end()
-                    continue
-
-                new_inner_parts.append(inner_body[cursor:abs_match_start])
-
-                brace_idx = abs_match_start + match.group().find('{')
-                f_start, f_end = self.find_block_content(inner_body, brace_idx)
-
-                if f_start is None:
-                    new_inner_parts.append(inner_body[abs_match_start:])
-                    break
-
-                formation_full = inner_body[abs_match_start:f_end]
-
-                # Check type
-                is_army = "type" in formation_full and "army" in formation_full.lower()
-                is_fleet = "type" in formation_full and "fleet" in formation_full.lower()
-
-                if is_army or is_fleet:
-                    f_header = formation_full[:f_start - abs_match_start + 1]
-                    f_body = formation_full[f_start - abs_match_start + 1 : -1]
-                    f_footer = "}"
-
-                    new_f_body_parts = []
-                    f_cursor = u_end = 0
-
-                    # Extract formation name for logging
-                    form_name = "Unknown"
-                    fn_m = re.search(r"name\s*=\s*\"?([^\s\"]+)\"?", formation_full)
-                    if fn_m: form_name = fn_m.group(1)
-
-                    # Detect if this formation belongs to the region being processed/abandoned
-                    formation_in_scope = False
-                    hq_m = re.search(r"hq_region\s*=\s*(?:sr:)?\"?([A-Za-z0-9_]+)\"?", f_body)
-                    if hq_m and region:
-                        hq_val = hq_m.group(1).strip()
-                        clean_region_arg = region.replace("sr:", "").strip()
-                        if hq_val == clean_region_arg:
-                            formation_in_scope = True
-
-                    self.log(f"[MIL] -> Checking formation '{form_name}'")
-
-                    while f_cursor < len(f_body):
-                        u_match = re.search(r"combat_unit\s*=\s*\{", f_body[f_cursor:])
-                        if not u_match:
-                            new_f_body_parts.append(f_body[f_cursor:])
-                            break
-
-                        u_abs_start = f_cursor + u_match.start()
-
-                        # Check if commented out
-                        substring = f_body[f_cursor:u_abs_start]
-                        last_newline = substring.rfind('\n')
-                        line_prefix = substring[last_newline+1:] if last_newline != -1 else substring
-                        if '#' in line_prefix:
-                            new_f_body_parts.append(f_body[f_cursor:u_abs_start + u_match.end()])
-                            f_cursor = u_abs_start + u_match.end()
-                            continue
-
-                        new_f_body_parts.append(f_body[f_cursor:u_abs_start])
-
-                        u_brace_idx = u_abs_start + u_match.group().find('{')
-                        u_start, u_end = self.find_block_content(f_body, u_brace_idx)
-
-                        if u_start is None:
-                            new_f_body_parts.append(f_body[u_abs_start:])
-                            break
-
-                        unit_block = f_body[u_abs_start:u_end]
-
-                        # --- HIERARCHICAL PARSING & STATE EXTRACTION ---
-                        # Extract state_region value, stripping 's:' if present, handles quotes
-                        sr_match = re.search(r"state_region\s*=\s*(?:s:)?\"?([A-Za-z0-9_]+)\"?", unit_block)
-                        found_state = None
-
-                        if sr_match:
-                            raw_state = sr_match.group(1)
-                            norm_state = self.normalize_state_key(raw_state)
-                            if norm_state in target_states_norm:
-                                found_state = norm_state
-
-                        if found_state:
-                            # --- LOGGING ---
-                            self.log(f"[MIL] Found combat_unit in {found_state} under c:{found_tag}")
-                            self.log(f"[MIL] -> Transferring unit to c:{new_tag}")
-
-                            clean_block = self.clean_unit_string(unit_block)
-
-                            # RE-HOME UNIT IF NEEDED
-                            if dest_home_state:
-                                # Replace the state_region value safely
-                                clean_block = re.sub(r"state_region\s*=\s*(?:s:)?\"?[A-Za-z0-9_.-]+\"?", f"state_region = s:{dest_home_state}", clean_block)
-
-                            if is_army: stolen_units_army.append(clean_block)
-                            elif is_fleet: stolen_units_fleet.append(clean_block)
-
-                            self.log(f"[MIL] Removed combat_unit from {form_name} formation.")
-                            files_modified = True
+        path=Path(filepath); text=path.read_text(encoding='utf-8-sig'); edits=[]; transferred=[]
+        states={self.normalize_state_key(st) for st in state_list}; new_tag=self.format_tag_clean(new_tag)
+        allocate = self.transferred_names(new_tag)
+        countries=[b for b in script_blocks(text) if b['key'] and b['key'].startswith('c:')]
+        for cb in countries:
+            tag=cb['key'][2:]
+            if tag==new_tag or (old_tag and tag!=self.format_tag_clean(old_tag)): continue
+            base=cb['opening']+1; body=text[base:cb['end']-1]
+            for form in script_blocks(body,'create_military_formation',0):
+                offset=base+form['opening']+1; inner=text[offset:base+form['end']-1]
+                kind=field(inner,'type'); hq=field(inner,'hq_region').removeprefix('sr:')
+                if kind=='fleet' and script_blocks(inner,'ship',0):
+                    # Modern ships have no state_region. Territorial edits do not delete or divide them.
+                    if force_move and hq==(region or '').removeprefix('sr:'):
+                        remaining=self.get_all_owned_states(tag)
+                        if remaining:
+                            new_hq=self.find_strategic_region(remaining[0])
+                            if new_hq:
+                                changed=put_field(inner,'hq_region','sr:'+new_hq.removeprefix('sr:'))
+                                edits.append((offset,base+form['end']-1,changed))
                         else:
-                            new_f_body_parts.append(unit_block)
-
-                        f_cursor = u_end
-
-                    rebuilt_formation_body = "".join(new_f_body_parts)
-
-                    # Check if formation is empty
-                    if "combat_unit" not in rebuilt_formation_body:
-                        self.log(f"      [DELETE] Formation {form_name} became empty. Deleted.")
-                        files_modified = True
-                    else:
-                        # Relocation Logic: If country abandoned the region (force_move), but formation remains (has units elsewhere),
-                        # we must move the HQ.
-                        if force_move and formation_in_scope:
-                            self.log(f"      [RELOCATE] {form_name} is in abandoned region {region}. Finding new HQ...")
-                            # Find first unit's state
-                            # We can grep state_region from rebuilt body
-                            new_hq_found = None
-                            
-                            # Simple regex scan on rebuilt body for first state_region
-                            m_st = re.search(r"state_region\s*=\s*(?:s:)?\"?([A-Za-z0-9_]+)\"?", rebuilt_formation_body)
-                            if m_st:
-                                first_state = m_st.group(1)
-                                norm_first_state = self.normalize_state_key(first_state)
-                                new_hq = self.find_strategic_region(f"s:{norm_first_state}")
-                                if new_hq:
-                                    new_hq_found = new_hq if new_hq.startswith("sr:") else f"sr:{new_hq}"
-                            
-                            if new_hq_found:
-                                # Update Body
-                                self.log(f"      [RELOCATE] Moving {form_name} to {new_hq_found}")
-                                rebuilt_formation_body = re.sub(r"hq_region\s*=\s*(?:sr:)?\"?[A-Za-z0-9_.-]+\"?", f"hq_region = {new_hq_found}", rebuilt_formation_body)
-                                files_modified = True
-                            else:
-                                self.log(f"      [WARN] Could not determine new HQ for {form_name}. It remains in {region}.", 'warn')
-
-                        new_inner_parts.append(f_header + rebuilt_formation_body + f_footer)
-                else:
-                    new_inner_parts.append(formation_full)
-
-                cursor = f_end
-
-            processed_file_parts.append(header + "".join(new_inner_parts) + footer)
-            last_idx = c_end
-            current_search_idx = c_end 
-        if not files_modified: return False
-        new_file_content = "".join(processed_file_parts)
-
-        # Detect original wrapper existence using loose search to catch "MILITARY_FORMATIONS={"
-        has_wrapper_orig = bool(re.search(r"(?:^|\s)MILITARY_FORMATIONS\s*=", content))
-
-        # Check if wrapper was lost in reconstruction
-        has_wrapper_new = bool(re.search(r"(?:^|\s)MILITARY_FORMATIONS\s*=", new_file_content))
-
-        if has_wrapper_orig and not has_wrapper_new:
-            self.log("[FIX] Restoring missing MILITARY_FORMATIONS wrapper.")
-            # Wrap the whole content
-            new_file_content = f"MILITARY_FORMATIONS = {{\n{new_file_content}\n}}"
-
-        def inject_new_formation(file_content, unit_buffer, f_type):
-            if not unit_buffer: return file_content
-            # Use dest_hq_region if provided, else use original region (which may be invalid if country left it)
-            # If dest_hq_region is None (explicitly passed as None), it means "Delete/Disband"
-
-            target_region = dest_hq_region if dest_hq_region else region
-
-            # If target_region is None/Empty, we cannot create formation. Units are effectively deleted.
-            if not target_region:
-                self.log(f"      [WARN] No valid HQ for {new_tag}. Units disbanded.", 'warn')
-                return file_content
-
-            clean_region_str = target_region.strip()
-            if not clean_region_str.startswith("sr:") and "region_" in clean_region_str:
-                hq_region_val = f"sr:{clean_region_str}"
-            elif not clean_region_str.startswith("sr:") and "region_" not in clean_region_str:
-                hq_region_val = f"sr:{clean_region_str}"
-            else:
-                hq_region_val = clean_region_str
-            immersive_name = self.generate_immersive_name(clean_region_str, f_type)
-            block_str = f"""
-\tcreate_military_formation = {{
-\t\tname = {immersive_name}
-\t\ttype = {f_type}
-\t\thq_region = {hq_region_val}
-\t\t# Transferred Units
-\t\t{"\n\t\t".join(unit_buffer)}
-\t}}
-"""
-            last_tag_pos = -1
-            curr = 0
-            while True:
-                ns, ne = self.get_block_range_safe(file_content, f"c:{new_tag}", curr)
-                if ns is None: break
-                last_tag_pos = ns
-                curr = ne
-            if last_tag_pos != -1:
-                _, end_brace = self.find_block_content(file_content, last_tag_pos)
-                insert_pos = end_brace - 1
-                return file_content[:insert_pos] + "\n" + block_str + "\n" + file_content[insert_pos:]
-            else:
-                # NEW LOGIC: Check for MILITARY_FORMATIONS wrapper to insert inside it
-                mf_start, mf_end = self.get_block_range_safe(file_content, "MILITARY_FORMATIONS")
-                if mf_start is not None:
-                    # Insert before the last brace of the wrapper
-                    insert_pos = mf_end - 1
-                    return file_content[:insert_pos] + f"\n\tc:{new_tag} ?= {{\n{block_str}\n\t}}\n" + file_content[insert_pos:]
-                else:
-                    return file_content + f"\n\nc:{new_tag} ?= {{\n{block_str}\n}}\n"
-        if stolen_units_army:
-            self.log(f"      [CREATE] Creating Army for {new_tag}")
-            new_file_content = inject_new_formation(new_file_content, stolen_units_army, "army")
-        if stolen_units_fleet:
-            self.log(f"      [CREATE] Creating Fleet for {new_tag}")
-            new_file_content = inject_new_formation(new_file_content, stolen_units_fleet, "fleet")
-        with open(filepath, 'w', encoding='utf-8-sig') as f: f.write(new_file_content)
+                            transferred.append(text[base+form['start']:offset] + put_field(inner, 'name', quoted(allocate(kind))) + '}')
+                            edits.append((base+form['start'],base+form['end'],''))
+                    continue
+                moved=[]; unit_edits=[]
+                for unit in script_blocks(inner,'combat_unit',0):
+                    raw=inner[unit['opening']+1:unit['end']-1]
+                    unit_state=field(raw,'state_region').removeprefix('s:')
+                    if unit_state not in states: continue
+                    if dest_home_state: raw=put_field(raw,'state_region','s:'+self.normalize_state_key(dest_home_state))
+                    moved.append('combat_unit = {'+raw+'}')
+                    unit_edits.append((unit['start'],unit['end']))
+                if not moved:
+                    if force_move and region and hq == region.removeprefix('sr:'):
+                        homes = self.get_all_owned_states(tag)
+                        replacement = next((r for home in homes if (r := self.find_strategic_region(home))), None)
+                        if replacement:
+                            edits.append((offset,base+form['end']-1,put_field(inner,'hq_region','sr:'+replacement.removeprefix('sr:'))))
+                    continue
+                for a,b in reversed(unit_edits): inner=inner[:a]+inner[b:]
+                if script_blocks(inner,'combat_unit',0):
+                    if force_move and hq==(region or '').removeprefix('sr:'):
+                        remaining=script_blocks(inner,'combat_unit',0)[0]
+                        home=field(inner[remaining['opening']+1:remaining['end']-1],'state_region')
+                        new_hq=self.find_strategic_region(home)
+                        if new_hq: inner=put_field(inner,'hq_region','sr:'+new_hq.removeprefix('sr:'))
+                    edits.append((offset,base+form['end']-1,inner))
+                else: edits.append((base+form['start'],base+form['end'],''))
+                target=dest_hq_region or self.find_strategic_region(dest_home_state or next(iter(states))) or region
+                if not target: raise ValueError('Cannot transfer units without a valid destination HQ.')
+                transferred.append('create_military_formation = {\n    name = '+quoted(allocate(kind))+'\n    type = '+kind+'\n    hq_region = sr:'+target.removeprefix('sr:')+'\n    '+'\n    '.join(moved)+'\n}')
+        if not edits: return False
+        for a,b,replacement in sorted(edits,reverse=True): text=text[:a]+replacement+text[b:]
+        if transferred:
+            block='\n    c:'+new_tag+' ?= {\n        '+'\n        '.join(transferred)+'\n    }\n'
+            wrappers=script_blocks(text,'MILITARY_FORMATIONS',0)
+            if not wrappers: raise ValueError('Missing MILITARY_FORMATIONS wrapper.')
+            pos=wrappers[0]['end']-1; text=text[:pos]+block+text[pos:]
+        atomic_text(path,text)
         return True
 
     def scan_state_resources(self, state_name):
-        """Scans state region files for resource data."""
-        # 1. Locate file
-        paths = []
-        if self.mod_path:
-            paths.append(os.path.join(self.mod_path, "map/data/state_regions"))
-            paths.append(os.path.join(self.mod_path, "map_data/state_regions"))
-        if self.vanilla_path:
-            paths.append(os.path.join(self.vanilla_path, "game/map/data/state_regions"))
-            paths.append(os.path.join(self.vanilla_path, "game/map_data/state_regions"))
+        state=self.normalize_state_key(state_name)
+        result=dict(arable_land=0,capped={},arable=[],discoverable=[])
+        for path in self.effective_files('map_data/state_regions'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,state,0):
+                body=text[b['opening']+1:b['end']-1]
+                result=dict(arable_land=int(field(body,'arable_land','0')),capped={},arable=[],discoverable=[])
+                for child in script_blocks(body,depth=0):
+                    inner=body[child['opening']+1:child['end']-1]
+                    if child['key']=='capped_resources': result['capped']={k:int(v[0]) for k,v in script_fields(inner).items()}
+                    elif child['key']=='arable_resources': result['arable']=[t.strip('"') for t,_,_ in script_tokens(inner)]
+                    elif child['key']=='resource':
+                        result['discoverable'].append(dict(type=field(inner,'type'),amount=int(field(inner,'undiscovered_amount','0')),raw=inner))
+        return result
 
-        data = {
-            "arable_land": 0,
-            "capped": {},
-            "arable": [],
-            "discoverable": [] # List of dicts {type, amount}
-        }
-
-        # Normalize state name consistently with the rest of the tool.
-        state_name = self.normalize_state_key(state_name)
-
-        found_content = None
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig', errors='ignore') as f:
-                            content = f.read()
-
-                        # Look for STATE_NAME = {
-                        if re.search(r"(^|\s)" + re.escape(state_name) + r"\s*=\s*\{", content):
-                            found_content = content
-                            break
-                    except: pass
-                if found_content: break
-            if found_content: break
-
-        if found_content:
-            # Extract block
-            s, e = self.get_block_range_safe(found_content, state_name)
-            if s is not None:
-                block = found_content[s:e]
-
-                # Arable Land
-                alm = re.search(r"arable_land\s*=\s*(\d+)", block)
-                if alm: data["arable_land"] = int(alm.group(1))
-
-                # Capped Resources
-                crm = re.search(r"capped_resources\s*=\s*\{", block)
-                if crm:
-                    crs, cre = self.find_block_content(block, crm.end()-1)
-                    if crs:
-                        cr_block = block[crs+1:cre-1]
-                        # Parse lines: building_x = N
-                        for m in re.finditer(r"(building_[A-Za-z0-9_]+)\s*=\s*(\d+)", cr_block):
-                            data["capped"][m.group(1)] = int(m.group(2))
-
-                # Arable Resources
-                arm = re.search(r"arable_resources\s*=\s*\{", block)
-                if arm:
-                    ars, are = self.find_block_content(block, arm.end()-1)
-                    if ars:
-                        ar_block = block[ars+1:are-1]
-                        # Parse strings
-                        # "building_x" "building_y"
-                        items = re.findall(r'"(building_[A-Za-z0-9_]+)"', ar_block)
-                        # Also unquoted
-                        # Split by whitespace, check for building_ prefix
-                        tokens = ar_block.split()
-                        items_unq = [t.strip() for t in tokens if t.strip().startswith("building_") and '"' not in t]
-
-                        all_ar = set(items + items_unq)
-                        data["arable"] = sorted(list(all_ar))
-
-                # Discoverable Resources (resource = { ... })
-                # Iterate all resource blocks
-                cursor = 0
-                while True:
-                    rm = re.search(r"resource\s*=\s*\{", block[cursor:])
-                    if not rm: break
-                    rs, re_idx = self.find_block_content(block, cursor + rm.end()-1)
-                    if rs:
-                        r_inner = block[rs+1:re_idx-1]
-                        # type = "x", undiscovered_amount = N
-                        tm = re.search(r'type\s*=\s*"?([A-Za-z0-9_]+)"?', r_inner)
-                        am = re.search(r'undiscovered_amount\s*=\s*(\d+)', r_inner)
-                        if tm and am:
-                            data["discoverable"].append({
-                                "type": tm.group(1),
-                                "amount": int(am.group(1))
-                            })
-                        cursor = re_idx
-                    else:
-                        cursor += 1
-
-        return data
-
+    @mod_operation
     def save_state_resources(self, state_name, data):
+        self._require_mod()
+        state=self.normalize_state_key(state_name)
+        selected=None
+        for path in self.effective_files('map_data/state_regions'):
+            text=path.read_text(encoding='utf-8-sig')
+            matches=script_blocks(text,state,0)
+            if matches: selected=(path,text,matches[0])
+        if not selected: raise ValueError(f'State definition missing: {state}')
+        path,text,b=selected
+        mod=Path(self.mod_path).resolve()
+        target=path if path.resolve().is_relative_to(mod) else mod/path.relative_to(Path(self.vanilla_path)/'game')
+        body=text[b['opening']+1:b['end']-1]
+        body=put_field(body,'arable_land',nonnegative(data['arable_land'],'Arable land'))
+        capped='capped_resources = {\n'+''.join(f'        {identifier(k)} = {nonnegative(v)}\n' for k,v in data['capped'].items())+'    }'
+        arable='arable_resources = { '+' '.join(quoted(identifier(k)) for k in data['arable'])+' }'
+        existing_resources={}
+        for child in script_blocks(body,'resource',0):
+            raw=body[child['opening']+1:child['end']-1]
+            existing_resources.setdefault(field(raw,'type'),[]).append(raw)
+        # Preserve discovered_amount, depletion and unknown fields for retained resource types.
+        resources=[]
+        for entry in data['discoverable']:
+            key=identifier(entry['type'])
+            candidates=existing_resources.get(key,[])
+            raw=candidates.pop(0) if candidates else '\n        type = '+quoted(key)+'\n'
+            resources.append('resource = {'+put_field(raw,'undiscovered_amount',nonnegative(entry['amount']))+'}')
+        for child in reversed(script_blocks(body,depth=0)):
+            if child['key'] in ('capped_resources','arable_resources','resource'):
+                body=body[:child['start']]+body[child['end']:]
+        body+='\n    '+capped+'\n    '+arable+'\n    '+'\n    '.join(resources)+'\n'
         self.perform_auto_backup()
-        # 1. Locate file (Mod > Vanilla copy)
-        # We need to write to Mod.
-        target_file = None
-        target_content = None
-
-        mod_states_dir = os.path.join(self.mod_path, "map_data", "state_regions")
-        if not os.path.exists(mod_states_dir):
-             mod_states_dir = os.path.join(self.mod_path, "map", "data", "state_regions")
-             if not os.path.exists(mod_states_dir):
-                 # Default to map_data/state_regions if neither exists
-                 mod_states_dir = os.path.join(self.mod_path, "map_data", "state_regions")
-                 os.makedirs(mod_states_dir, exist_ok=True)
-
-        state_name = self.normalize_state_key(state_name)
-
-        # Check existing mod file
-        for root, _, files in os.walk(mod_states_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: c = f.read()
-                    if re.search(r"(^|\s)" + re.escape(state_name) + r"\s*=\s*\{", c):
-                        target_file = path
-                        target_content = c
-                        break
-                except: pass
-            if target_file: break
-
-        # If not in mod, check vanilla and COPY
-        if not target_file and self.vanilla_path:
-            # Check both legacy and new structure
-            v_dirs = [
-                os.path.join(self.vanilla_path, "game", "map_data", "state_regions"),
-                os.path.join(self.vanilla_path, "game", "map", "data", "state_regions")
-            ]
-            for v_dir in v_dirs:
-                if not os.path.exists(v_dir): continue
-                for root, _, files in os.walk(v_dir):
-                    for file in files:
-                        if not file.endswith(".txt"): continue
-                        path = os.path.join(root, file)
-                        try:
-                            with open(path, 'r', encoding='utf-8-sig', errors='ignore') as f: c = f.read()
-                            if re.search(r"(^|\s)" + re.escape(state_name) + r"\s*=\s*\{", c):
-                                # Found it. Copy to mod.
-                                target_file = os.path.join(mod_states_dir, file)
-                                target_content = c
-                                with open(target_file, 'w', encoding='utf-8-sig') as f_out:
-                                    f_out.write(c)
-                                self.log(f"[RES] Copied {file} from vanilla to mod.", 'info')
-                                break
-                        except: pass
-                    if target_file: break
-                if target_file: break
-
-        if not target_file:
-            self.log(f"[ERROR] Could not find state definition for {state_name}", 'error')
-            return
-
-        # 2. Modify Content
-        # We need to replace/update blocks inside STATE_NAME = { ... }
-        s, e = self.get_block_range_safe(target_content, state_name)
-        if s is None: return
-
-        block = target_content[s:e]
-
-        # A. Arable Land
-        if "arable_land" in block:
-            block = re.sub(r"arable_land\s*=\s*\d+", f"arable_land = {data['arable_land']}", block)
-        else:
-            # Insert at beginning of block (after opening brace)
-            first_brace = block.find('{')
-            block = block[:first_brace+1] + f"\n\tarable_land = {data['arable_land']}" + block[first_brace+1:]
-
-        # B. Capped Resources
-        # Construct block
-        capped_lines = []
-        for k, v in data['capped'].items():
-            capped_lines.append(f"\t\t{k} = {v}")
-
-        capped_str = "capped_resources = {\n" + "\n".join(capped_lines) + "\n\t}"
-
-        if "capped_resources" in block:
-            # Replace existing block
-            # Use regex to find start, helper for end
-            cm = re.search(r"capped_resources\s*=\s*\{", block)
-            if cm:
-                cs, ce = self.find_block_content(block, cm.end()-1)
-                if cs:
-                    block = block[:cm.start()] + capped_str + block[ce:]
-        else:
-            # Append before closing brace
-            last_brace = block.rfind('}')
-            block = block[:last_brace] + "\n\t" + capped_str + "\n" + block[last_brace:]
-
-        # C. Arable Resources
-        arable_lines = [f'"{x}"' for x in data['arable']]
-        arable_str = "arable_resources = { " + " ".join(arable_lines) + " }"
-
-        if "arable_resources" in block:
-            am = re.search(r"arable_resources\s*=\s*\{", block)
-            if am:
-                as_, ae = self.find_block_content(block, am.end()-1)
-                if as_:
-                    block = block[:am.start()] + arable_str + block[ae:]
-        else:
-            last_brace = block.rfind('}')
-            block = block[:last_brace] + "\n\t" + arable_str + "\n" + block[last_brace:]
-
-        # D. Discoverable Resources
-        # First, remove ALL existing resource blocks
-        # We'll use a loop to strip them out
-        while True:
-            rm = re.search(r"resource\s*=\s*\{", block)
-            if not rm: break
-            rs, re_idx = self.find_block_content(block, rm.end()-1)
-            if rs:
-                block = block[:rm.start()] + block[re_idx:]
-            else: break # Should not happen
-
-        # Now append new ones
-        res_strings = []
-        for item in data['discoverable']:
-            res_strings.append(f'\tresource = {{\n\t\ttype = "{item["type"]}"\n\t\tundiscovered_amount = {item["amount"]}\n\t}}')
-
-        if res_strings:
-            last_brace = block.rfind('}')
-            block = block[:last_brace] + "\n" + "\n".join(res_strings) + "\n" + block[last_brace:]
-
-        # Write back
-        final_content = target_content[:s] + block + target_content[e:]
-        with open(target_file, 'w', encoding='utf-8-sig') as f: f.write(final_content)
-        self.log(f"[RES] Updated resources for {state_name}", 'success')
+        atomic_text(target,text[:b['opening']+1]+body+text[b['end']-1:])
+        self.state_manager.load_state_regions()
+        self.log(f'[RES] Saved resources for {state}', 'success')
 
     def clean_military_smart(self, old_tag, new_tag, region, state_list, force_move=False, dest_hq_region=None, dest_home_state=None):
         # Auto-backup usually done before this in transfer flow
@@ -2539,7 +1911,7 @@ class Vic3Logic:
                     abs_start = cursor + m.start()
                     s, e = self.find_block_content(new_content, cursor + m.end() - 1)
 
-                    if s:
+                    if s is not None:
                         block = new_content[s:e]
                         # Check for units in old state
                         pat = re.compile(r"state_region\s*=\s*\"?(s:)?" + re.escape(old_clean) + r"\"?\b")
@@ -2619,6 +1991,111 @@ class Vic3Logic:
                     with open(path, 'w', encoding='utf-8-sig') as f: f.write("\n".join(new_lines))
                     self.log(f"[CHAR] Disconnected commanders in {file}")
 
+    def flag_catalog(self):
+        catalog = {}
+        for path in self.effective_files('common/coat_of_arms/coat_of_arms'):
+            content = path.read_text(encoding='utf-8-sig')
+            for block in script_blocks(content, depth=0):
+                key = block['key']
+                if key:
+                    catalog[key] = (path, content[block['opening']+1:block['end']-1])
+        return catalog
+
+    @mod_operation
+    def save_flag(self, key, previous, draft):
+        identifier(key, 'Flag key')
+        script_blocks(draft)
+        entry = self.flag_catalog().get(key)
+        if (entry[1] if entry else None) != previous:
+            raise ValueError('Flag changed on disk. Reload before saving.')
+        root = Path(self.mod_path)
+        if entry:
+            source = entry[0]
+            target = source if source.is_relative_to(root) else root/source.relative_to(Path(self.vanilla_path)/'game')
+            content = source.read_text(encoding='utf-8-sig')
+            block = script_blocks(content,key,0)[-1]
+            content = content[:block['opening']+1]+draft+content[block['end']-1:]
+        else:
+            target = root/'common/coat_of_arms/coat_of_arms'/('99_v3mt_'+key+'.txt')
+            content = target.read_text(encoding='utf-8-sig') if target.exists() else ''
+            content += '\n'+key+' = {'+draft+'}\n'
+        atomic_text(target,content)
+
+    def resolve_transfer_technologies(self, states, recipient, donors):
+        recipient = self.format_tag_clean(recipient)
+        donors = {self.format_tag_clean(tag) for tag in donors}
+        entries = [entry for state in dict.fromkeys(states) for entry in self.scan_state_buildings(state)
+                   if entry['region_tag'] in donors and entry['region_tag'] != recipient]
+        if not entries:
+            return
+        def definitions(folder):
+            result = {}
+            for path in self.effective_files(folder):
+                text = path.read_text(encoding='utf-8-sig')
+                for block in script_blocks(text, depth=0):
+                    result[block['key']] = text[block['opening']+1:block['end']-1]
+            return result
+
+        def members(body, key):
+            return {token.strip('"') for block in script_blocks(body,key,0)
+                    for token,_,_ in script_tokens(body[block['opening']+1:block['end']-1])
+                    if re.fullmatch(r'"?[A-Za-z0-9_]+"?',token)}
+
+        buildings = definitions('common/buildings')
+        methods = definitions('common/production_methods')
+        required = []
+        for entry in entries:
+            needs = members(buildings.get(entry['type'],''),'unlocking_technologies')
+            block = script_blocks(entry['snapshot'], 'create_building',0)[0]
+            inner = entry['snapshot'][block['opening']+1:block['end']-1]
+            for method in members(inner,'activate_production_methods'):
+                needs.update(members(methods.get(method,''),'unlocking_technologies'))
+            if needs:
+                required.append((entry,needs))
+        if not required:
+            return
+        effects = definitions('common/scripted_effects')
+        known = set()
+        visited = set()
+        def read_grants(body):
+            # Repeated assignments matter. Inspect only unconditional direct effects.
+            tokens = list(script_tokens(body))
+            depth = 0
+            for i,(key,_,_) in enumerate(tokens):
+                if key == '{': depth += 1
+                elif key == '}': depth -= 1
+                elif depth == 0 and i+2 < len(tokens) and tokens[i+1][0] == '=':
+                    value = tokens[i+2][0].strip('"')
+                    if key == 'add_technology_researched':
+                        known.add(value.removeprefix('tech:'))
+                    elif key in effects and value == 'yes' and key not in visited:
+                        visited.add(key)
+                        read_grants(effects[key])
+        for path in self.effective_files('common/history/countries'):
+            text = path.read_text(encoding='utf-8-sig')
+            for country in script_blocks(text,'c:'+recipient,1):
+                read_grants(text[country['opening']+1:country['end']-1])
+        conflicts = [(entry,needs-known) for entry,needs in required if needs-known]
+        if not conflicts:
+            return
+        choose = getattr(self,'choose_transfer_technology',None)
+        if choose is None:
+            raise ValueError('A building technology decision is required for '+recipient)
+        decision = choose(recipient,conflicts)
+        if decision == 'grant':
+            folder = Path(self.mod_path)/'common/history/countries'
+            path = folder/('zz_v3mt_transfer_tech_'+recipient+'.txt')
+            text = path.read_text(encoding='utf-8-sig') if path.exists() else ''
+            missing = sorted(set.union(*(needs for _,needs in conflicts)))
+            grants = '\n'.join('    add_technology_researched = '+identifier(tech) for tech in missing)
+            atomic_text(path,text+f'\nCOUNTRIES = {{ c:{recipient} ?= {{\n{grants}\n}} }}\n')
+        elif decision == 'delete':
+            for entry,_ in sorted(conflicts,key=lambda pair:(pair[0]['file'],pair[0]['indices']['start']),reverse=True):
+                self.save_state_building(entry,delete=True)
+        else:
+            raise ValueError('Transfer cancelled at the building technology decision.')
+
+    @mod_operation
     def perform_transfer_sequence(self, states_clean, new_tag, known_old_owners=None, prune_refs=True):
         self.log("--- Processing Map Data ---")
 
@@ -2634,29 +2111,15 @@ class Vic3Logic:
             owners_found.discard(clean_new)
             target_owners = list(owners_found)
 
-        # NEW: Ensure country history exists if missing
-        if target_owners:
-            donor_tag = target_owners[0]
-            # Try to be specific: Owner of the first state
-            if not known_old_owners and states_clean:
-                first_state_owners = self.scan_state_region_owners(states_clean[0])
-                clean_new_check = new_tag.replace("c:", "").strip().upper()
-                valid_donors = [o for o in first_state_owners if o.replace("c:", "").strip().upper() != clean_new_check]
-                if valid_donors:
-                    donor_tag = valid_donors[0]
-
-            self.ensure_country_history_exists(new_tag, donor_tag, target_states=states_clean)
-
         # 1. Transfer Ownership
         # If known_old_owners is provided (Targeted Transfer), we restrict to those.
         # Otherwise (None), we let transfer_ownership_batch detect owners per-block (Auto Transfer).
         owners_to_pass = known_old_owners if known_old_owners else None
 
-        _, railway_recipients = self.transfer_ownership_batch(states_clean, owners_to_pass, new_tag)
+        self.resolve_transfer_technologies(states_clean,new_tag,target_owners or [])
+        self.transfer_ownership_batch(states_clean, owners_to_pass, new_tag)
 
-        # 1b. Ensure Railway Tech for recipients
-        for r_tag in railway_recipients:
-            self.ensure_railway_tech(r_tag)
+        self.clean_transferred_state_references(states_clean)
 
         # 1c. Clean Trade History for transferred states
         self.clean_trade_history(states_clean)
@@ -2712,86 +2175,12 @@ class Vic3Logic:
 
     # --- COUNTRY MODIFICATION LOGIC ---
     def load_country_localization(self, tag):
-        loc_dir = os.path.join(self.mod_path, "localization", "english")
-        if not os.path.exists(loc_dir): return "", ""
+        return self.get_loc_text(tag),self.get_loc_text(tag+'_ADJ')
 
-        name = ""
-        adj = ""
-
-        def search_dir(directory):
-            n, a = "", ""
-            if not os.path.exists(directory): return "", ""
-            for root, _, files in os.walk(directory):
-                for file in files:
-                    if not file.endswith(".yml"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                    m_name = re.search(r'^\s*' + re.escape(tag) + r':\d?\s*"(.*)"', content, re.MULTILINE | re.IGNORECASE)
-                    if m_name: n = m_name.group(1)
-
-                    m_adj = re.search(r'^\s*' + re.escape(tag) + r'_ADJ:\d?\s*"(.*)"', content, re.MULTILINE | re.IGNORECASE)
-                    if m_adj: a = m_adj.group(1)
-            return n, a
-
-        n1, a1 = search_dir(loc_dir)
-        n2, a2 = search_dir(os.path.join(loc_dir, "replace"))
-        return (n2 if n2 else n1), (a2 if a2 else a1)
-
+    @mod_operation
     def save_country_localization(self, tag, name, adj):
-        self.perform_auto_backup()
-        loc_dir = os.path.join(self.mod_path, "localization", "english")
-        rep_dir = os.path.join(loc_dir, "replace")
-        os.makedirs(rep_dir, exist_ok=True)
-
-        # Check if a replace file for this tag already exists to append/modify
-        target_file = None
-        for root, _, files in os.walk(rep_dir):
-            for file in files:
-                if not file.endswith(".yml"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
-
-                if re.search(r"^\s*" + re.escape(tag) + r":", content, re.MULTILINE):
-                    target_file = path
-                    break
-            if target_file: break
-
-        if not target_file:
-            target_file = os.path.join(rep_dir, f"{tag.lower()}_l_english.yml")
-            if not os.path.exists(target_file):
-                 with open(target_file, 'w', encoding='utf-8-sig') as f: f.write("l_english:\n")
-
-        try:
-            with open(target_file, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(target_file, 'r', encoding='utf-8') as f: content = f.read()
-
-        # Update Name
-        if re.search(r"^\s*" + re.escape(tag) + r":", content, re.MULTILINE):
-            content = re.sub(r'^\s*' + re.escape(tag) + r':.*', f' {tag}: "{name}"', content, flags=re.MULTILINE)
-        else:
-            content += f' {tag}: "{name}"\n'
-
-        # Update Adjective
-        if re.search(r"^\s*" + re.escape(tag) + r"_ADJ:", content, re.MULTILINE):
-            content = re.sub(r'^\s*' + re.escape(tag) + r'_ADJ:.*', f' {tag}_ADJ: "{adj}"', content, flags=re.MULTILINE)
-        else:
-            content += f' {tag}_ADJ: "{adj}"\n'
-
-        # Update Def
-        if re.search(r"^\s*" + re.escape(tag) + r"_DEF:", content, re.MULTILINE):
-            content = re.sub(r'^\s*' + re.escape(tag) + r'_DEF:.*', f' {tag}_DEF: "{name}"', content, flags=re.MULTILINE)
-        else:
-            content += f' {tag}_DEF: "{name}"\n'
-
-        with open(target_file, 'w', encoding='utf-8-sig') as f: f.write(content)
-        self.log(f"[SAVE] Localization saved to {target_file}", 'success')
+        tag=identifier(self.format_tag_clean(tag))
+        self._localize('replace/'+tag.lower(),{tag:name,tag+'_ADJ':adj,tag+'_DEF':name})
 
     def load_country_definition_data(self, tag):
         def_path = os.path.join(self.mod_path, "common", "country_definitions")
@@ -2835,6 +2224,7 @@ class Vic3Logic:
                         return rgb, capital, path
         return None, None, None
 
+    @mod_operation
     def save_country_definition(self, tag, rgb, capital, filepath, cultures=None, religion=None):
         self.perform_auto_backup()
         if not filepath or not os.path.exists(filepath):
@@ -2853,7 +2243,7 @@ class Vic3Logic:
                 new_block = block
                 r, g, b = rgb
                 if re.search(r"color\s*=", new_block):
-                    new_block = re.sub(r"color\s*=\s*\{[^}]+\}", f"color = {{ {r} {g} {b} }}", new_block)
+                    new_block = re.sub(r"color\s*=\s*(?:hsv360|hsv|rgb)?\s*\{[^}]+\}", f"color = {{ {r} {g} {b} }}", new_block)
                 else:
                     new_block = new_block[:new_block.rfind('}')] + f"\n\tcolor = {{ {r} {g} {b} }}\n}}"
                 if capital:
@@ -2883,42 +2273,13 @@ class Vic3Logic:
                 self.log(f"[SAVE] Updated definitions in {filepath}", 'success')
 
     def load_character_template(self, template_name):
-        tmpl_dir = os.path.join(self.mod_path, "common", "character_templates")
-        if not os.path.exists(tmpl_dir): return None
-        for root, _, files in os.walk(tmpl_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
-
-                # Search for template = { ... }
-                # Using regex to find start, then block helper
-                m = re.search(r"(^|\s)" + re.escape(template_name) + r"\s*=\s*\{", content, re.IGNORECASE)
-                if m:
-                    start = m.end() - 1
-                    _, end = self.find_block_content(content, start)
-                    if end:
-                        block = content[start:end]
-                        data = {"first": "", "last": "", "ig": "", "ideology": "", "is_ruler": False}
-                        if re.search(r"ruler\s*=\s*yes", block, re.IGNORECASE): data["is_ruler"] = True
-
-                        fn = re.search(r'first_name\s*=\s*(?:"([^"]+)"|([^\s#]+))', block)
-                        if fn: data["first"] = fn.group(1) if fn.group(1) else fn.group(2)
-
-                        ln = re.search(r'last_name\s*=\s*(?:"([^"]+)"|([^\s#]+))', block)
-                        if ln: data["last"] = ln.group(1) if ln.group(1) else ln.group(2)
-
-                        ig = re.search(r'interest_group\s*=\s*([A-Za-z0-9_]+)', block)
-                        if ig: data["ig"] = ig.group(1)
-
-                        ideo = re.search(r'(trait|ideology)\s*=\s*(ideology_[A-Za-z0-9_]+)', block)
-                        if ideo: data["ideology"] = ideo.group(2)
-
-                        return data
-        return None
+        result=None
+        for path in self.effective_files('common/character_templates'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,template_name,0):
+                body=text[b['opening']+1:b['end']-1]
+                result=dict(first=field(body,'first_name'),last=field(body,'last_name'),ig=field(body,'interest_group'),ideology=field(body,'ideology') or field(body,'trait'),is_ruler=field(body,'ruler')=='yes',file=str(path),key=template_name)
+        return result
 
     def load_country_history_details(self, tag):
         info = { "gov_type": "monarchy", "laws": [], "ruler": {"first": "", "last": "", "ig": "", "ideology": ""} }
@@ -2939,7 +2300,7 @@ class Vic3Logic:
                     idx = 0
                     while True:
                         s, e = self.get_block_range_safe(content, f"c:{clean_tag}", idx)
-                        if not s: break
+                        if s is None: break
                         block = content[s:e]
                         laws = re.findall(r"activate_law\s*=\s*([A-Za-z0-9_:]+)", block)
                         info["laws"].extend(laws)
@@ -2951,7 +2312,7 @@ class Vic3Logic:
                             if not m: break
                             abs_start = char_idx + m.start()
                             bs, be = self.find_block_content(block, char_idx + m.end() - 1)
-                            if bs:
+                            if bs is not None:
                                 char_block = block[bs:be]
                                 if re.search(r"ruler\s*=\s*yes", char_block, re.IGNORECASE):
                                     fn = re.search(r'first_name\s*=\s*(?:"([^"]+)"|([^\s#]+))', char_block)
@@ -2981,7 +2342,7 @@ class Vic3Logic:
                     idx = 0
                     while True:
                         s, e = self.get_block_range_safe(content, f"c:{clean_tag}", idx)
-                        if not s: break
+                        if s is None: break
                         block = content[s:e]
 
                         # Scan for create_character with templates
@@ -2991,7 +2352,7 @@ class Vic3Logic:
                             if not m: break
                             start = c_cursor + m.start()
                             bs, be = self.find_block_content(block, c_cursor + m.end() - 1)
-                            if bs:
+                            if bs is not None:
                                 inner = block[bs:be]
                                 tmpl_match = re.search(r"template\s*=\s*([A-Za-z0-9_.-]+)", inner, re.IGNORECASE)
                                 if tmpl_match:
@@ -3034,7 +2395,7 @@ class Vic3Logic:
                                 if not m: break
                                 start = cursor + m.start()
                                 bs, be = self.find_block_content(content, cursor + m.end() - 1)
-                                if bs:
+                                if bs is not None:
                                     block_inner = content[bs:be]
                                     if re.search(r"ruler\s*=\s*yes", block_inner, re.IGNORECASE):
                                         # Found a ruler definition!
@@ -3065,93 +2426,65 @@ class Vic3Logic:
         elif "law_theocracy" in info["laws"]: info["gov_type"] = "theocracy"
         return info
 
+    @mod_operation
     def save_country_history(self, tag, laws, ruler_info):
-        self.perform_auto_backup()
-        hist_dir = os.path.join(self.mod_path, "common", "history", "countries")
-        clean_tag = tag.replace("c:", "").strip()
-        target_path = None
-        target_content = None
-        for root, _, files in os.walk(hist_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
-                if re.search(r"c:" + re.escape(clean_tag) + r"\b", content):
-                    target_path = path; target_content = content; break
-
-        if not target_path: return self.log("[ERROR] No history file found.", 'error')
-        s, e = self.get_block_range_safe(target_content, f"c:{clean_tag}")
-        if not s: return
-        block = target_content[s:e]
-        new_block = block
-
-        # Laws
-        laws_to_set = laws
-
-        exclusive_laws = [
-            ["law_monarchy", "law_presidential_republic", "law_parliamentary_republic", "law_theocracy", "law_council_republic"],
-            ["law_interventionism", "law_laissez_faire", "law_command_economy", "law_traditionalism", "law_agrarianism"],
-            ["law_free_trade", "law_protectionism", "law_isolationism", "law_mercantilism"],
-            ["law_autocracy", "law_oligarchy", "law_landed_voting", "law_wealth_voting", "law_census_voting", "law_universal_suffrage", "law_anarchy", "law_single_party_state"]
-        ]
-
-        for law in laws_to_set:
-            # Remove conflicting
-            for group in exclusive_laws:
-                if law in group:
-                    for ex in group:
-                        if ex != law:
-                            new_block = re.sub(r"\s*activate_law\s*=\s*(law_type:)?" + re.escape(ex) + r"\b", "", new_block)
-
-            # Add if missing
-            if not re.search(r"activate_law\s*=\s*(law_type:)?" + re.escape(law), new_block):
-                 new_block = new_block[:new_block.rfind('}')] + f"\n\t\tactivate_law = law_type:{law}\n\t}}"
-
-        # Ruler
-        char_idx = 0
-        ruler_start = -1; ruler_end = -1
-        while True:
-            m = re.search(r"create_character\s*=\s*\{", new_block[char_idx:])
-            if not m: break
-            abs_start = char_idx + m.start()
-            bs, be = self.find_block_content(new_block, char_idx + m.end() - 1)
-            if bs:
-                sub = new_block[bs:be]
-                if "ruler = yes" in sub: ruler_start = abs_start; ruler_end = be; break
-                char_idx = be
-            else: break
-
-        if ruler_start != -1:
-            # Update existing inline ruler
-            rb = new_block[ruler_start:ruler_end]
-            if ruler_info["first"]: rb = re.sub(r'first_name\s*=\s*(?:"([^"]+)"|([^\s#]+))', f'first_name = "{ruler_info["first"]}"', rb)
-            if ruler_info["last"]: rb = re.sub(r'last_name\s*=\s*(?:"([^"]+)"|([^\s#]+))', f'last_name = "{ruler_info["last"]}"', rb)
-            if ruler_info["ig"]: rb = re.sub(r'interest_group\s*=\s*[A-Za-z0-9_]+', f'interest_group = {ruler_info["ig"]}', rb)
-            if ruler_info["ideology"]:
-                rb = re.sub(r'\s*(trait|ideology)\s*=\s*ideology_[a-z_]+', '', rb)
-                rb = rb[:rb.rfind('}')] + f"\n\t\tideology = {ruler_info['ideology']}\n\t}}"
-            new_block = new_block[:ruler_start] + rb + new_block[ruler_end:]
-        else:
-            # Create new ruler block if none found (overrides/adds to vanilla)
-            # Default birth_date needed if creating fresh
-            ideo_line = f"\n            ideology = {ruler_info['ideology']}" if ruler_info['ideology'] else ""
-            new_ruler_block = f"""
-        create_character = {{
-            first_name = "{ruler_info['first']}"
-            last_name = "{ruler_info['last']}"
-            birth_date = 1800.1.1
-            ruler = yes
-            interest_group = {ruler_info['ig']}{ideo_line}
-        }}"""
-            # Insert before closing brace of country block
-            new_block = new_block[:new_block.rfind('}')] + new_ruler_block + "\n\t}"
-
-        target_content = target_content[:s] + new_block + target_content[e:]
-        with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(target_content)
-        self.log(f"[SAVE] History updated in {target_path}", 'success')
+        tag=self.format_tag_clean(tag)
+        # Resolve law groups from the installed definitions; hardcoded lists miss new laws.
+        groups={}
+        for path in self.effective_files('common/laws'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,depth=0):
+                groups[b['key']]=field(text[b['opening']+1:b['end']-1],'group')
+        laws=[identifier(l.removeprefix('law_type:')) for l in laws]
+        if any(not groups.get(l) for l in laws): raise ValueError('Load current law definitions before changing laws.')
+        if len({groups[l] for l in laws})!=len(laws): raise ValueError('Choose one law per law group.')
+        selected_groups={groups[l] for l in laws}
+        inserted=False
+        for source in self.effective_files('common/history/countries'):
+            original=source.read_text(encoding='utf-8-sig')
+            countries=script_blocks(original,'c:'+tag)
+            if not countries: continue
+            target=self._editable_copy(source); text=target.read_text(encoding='utf-8-sig')
+            for country in reversed(script_blocks(text,'c:'+tag)):
+                body=text[country['opening']+1:country['end']-1]
+                # Remove only direct activate_law assignments in the selected groups.
+                tokens=list(script_tokens(body)); depth=0; edits=[]
+                for i,(token,a,b) in enumerate(tokens):
+                    if token=='{': depth+=1
+                    elif token=='}': depth-=1
+                    elif depth==0 and token=='activate_law' and i+2<len(tokens) and tokens[i+1][0]=='=':
+                        law=tokens[i+2][0].removeprefix('law_type:')
+                        if groups.get(law) in selected_groups: edits.append((a,tokens[i+2][2]))
+                for a,b in reversed(edits):body=body[:a]+body[b:]
+                if not inserted:
+                    body+='\n'+''.join(f'        activate_law = law_type:{law}\n' for law in laws);inserted=True
+                text=text[:country['opening']+1]+body+text[country['end']-1:]
+            atomic_text(target,text)
+        if laws and not inserted: raise ValueError('Import the country history before changing laws.')
+        if not any(ruler_info.get(k) for k in ('first','last','ig','ideology')): return
+        candidates=[]
+        for rel in ('common/history/countries','common/history/characters'):
+            for path in self.effective_files(rel):
+                text=path.read_text(encoding='utf-8-sig')
+                for cb in script_blocks(text,'c:'+tag):
+                    offset=cb['opening']+1;body=text[offset:cb['end']-1]
+                    for char in script_blocks(body,'create_character',0):
+                        raw=body[char['opening']+1:char['end']-1]; template=field(raw,'template')
+                        data=self.load_character_template(template) if template else None
+                        if field(raw,'ruler')=='yes':candidates.append((path,offset+char['opening']+1,offset+char['end']-1,None))
+                        elif data and data['is_ruler']:candidates.append((Path(data['file']),None,None,template))
+        if len(candidates)!=1: raise ValueError('Cannot identify exactly one starting ruler. Check character history/templates before editing.')
+        source,a,b,template=candidates[0];target=self._editable_copy(source);text=target.read_text(encoding='utf-8-sig')
+        if template:
+            block=script_blocks(text,template,0)[0];a,b=block['opening']+1,block['end']-1
+        body=text[a:b]
+        for key,argument in [('first_name','first'),('last_name','last'),('interest_group','ig'),('ideology','ideology')]:
+            value=ruler_info.get(argument)
+            if value:
+                if key=='ideology' and field(body,'trait').startswith('ideology_'):
+                    old=script_fields(body)['trait']; body=body[:old[1]]+body[old[2]:]
+                body=put_field(body,key,quoted(value) if argument in ('first','last') else identifier(value))
+        atomic_text(target,text[:a]+body+text[b:])
 
     # --- DIPLOMACY LOGIC ---
     # --- DIPLOMACY LOGIC ---
@@ -3186,7 +2519,7 @@ class Vic3Logic:
                     abs_start = idx + match.start()
                     s, e = self.find_block_content(content, idx + match.end() - 1)
 
-                    if s:
+                    if s is not None:
                         block_body = content[s:e]
 
                         # Check for subject pacts targeting our tag
@@ -3205,7 +2538,7 @@ class Vic3Logic:
                             new_body_parts.append(block_body[cursor:pact_start])
 
                             bs, be = self.find_block_content(block_body, cursor + m.end() - 1)
-                            if bs:
+                            if bs is not None:
                                 pact_inner = block_body[bs:be]
                                 is_target = re.search(r"country\s*=\s*c:" + re.escape(clean_target) + r"\b", pact_inner)
 
@@ -3269,7 +2602,7 @@ class Vic3Logic:
                 idx = 0
                 while True:
                     s, e = self.get_block_range_safe(content, f"c:{clean_tag}", idx)
-                    if not s: break
+                    if s is None: break
                     block = content[s:e]
 
                     # Subjects
@@ -3311,6 +2644,7 @@ class Vic3Logic:
                     idx = e
         return info
 
+    @mod_operation
     def add_diplomatic_pact(self, tag, target, pact_type, category):
         self.perform_auto_backup()
         # category: subject, rival, embargo, truce
@@ -3349,7 +2683,7 @@ class Vic3Logic:
 
         # Insert
         s, e = self.get_block_range_safe(content, f"c:{clean_tag}")
-        if s:
+        if s is not None:
             # Append to existing block
             block = content[s:e]
             new_block = block[:block.rfind('}')] + "\n" + entry + "\n\t}"
@@ -3358,7 +2692,7 @@ class Vic3Logic:
             # Create new block
             # Find DIPLOMACY block
             d_s, d_e = self.get_block_range_safe(content, "DIPLOMACY")
-            if d_s:
+            if d_s is not None:
                 new_block = f"\n\tc:{clean_tag} ?= {{\n{entry}\n\t}}"
                 content = content[:d_e-1] + new_block + "\n}" + content[d_e:]
             else:
@@ -3367,76 +2701,21 @@ class Vic3Logic:
         with open(filepath, 'w', encoding='utf-8-sig') as f: f.write(content)
         self.log(f"[DIP] Added {pact_type} with {clean_target} in {filename}", 'success')
 
+    @mod_operation
     def remove_diplomatic_pact(self, tag, target, pact_type):
-        self.perform_auto_backup()
-        dip_dir = os.path.join(self.mod_path, "common", "history", "diplomacy")
-        clean_tag = tag.replace("c:", "").strip()
-        clean_target = target.replace("c:", "").strip()
+        country='c:'+self.format_tag_clean(tag); target='c:'+self.format_tag_clean(target)
+        for path in sorted((Path(self.mod_path)/'common/history/diplomacy').rglob('*.txt')):
+            text=path.read_text(encoding='utf-8-sig'); edits=[]
+            for cb in script_blocks(text,country):
+                offset=cb['opening']+1; body=text[offset:cb['end']-1]
+                for pact in script_blocks(body,depth=0):
+                    inner=body[pact['opening']+1:pact['end']-1]
+                    matching_type=(pact['key']=='create_bidirectional_truce') if pact_type=='truce' else (pact['key']=='create_diplomatic_pact' and field(inner,'type')==pact_type)
+                    if matching_type and field(inner,'country')==target: edits.append((offset+pact['start'],offset+pact['end']))
+            for a,b in sorted(edits,reverse=True): text=text[:a]+text[b:]
+            if edits: atomic_text(path,text)
 
-        files_to_check = ["00_subject_relationships.txt", "00_rivalries.txt", "00_embargos.txt", "00_truces.txt"]
-
-        for fname in files_to_check:
-            fpath = os.path.join(dip_dir, fname)
-            if not os.path.exists(fpath): continue
-
-            try:
-                with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
-            except:
-                with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
-
-            s, e = self.get_block_range_safe(content, f"c:{clean_tag}")
-            if not s: continue
-
-            block = content[s:e]
-
-            # Regex to match the specific pact
-            # Need to match { ... country = c:TARGET ... type = TYPE } across lines
-            # This is hard with regex alone.
-
-            # Simple approach: Find block start, verify content, remove.
-            # Using block finder again inside.
-
-            new_inner_parts = []
-            cursor = 0
-            # Skip header "c:TAG ?= {"
-            header_len = content[s:].find('{') + 1
-            inner_body = block[header_len:-1]
-
-            change_made = False
-
-            while cursor < len(inner_body):
-                m = re.search(r"(create_diplomatic_pact|create_bidirectional_truce)\s*=\s*\{", inner_body[cursor:])
-                if not m:
-                    new_inner_parts.append(inner_body[cursor:])
-                    break
-
-                abs_start = cursor + m.start()
-                new_inner_parts.append(inner_body[cursor:abs_start])
-
-                bs, be = self.find_block_content(inner_body, cursor + m.end() - 1)
-                if bs:
-                    pact_block = inner_body[bs:be]
-
-                    # Check if this is the one to delete
-                    is_target = f"c:{clean_target}" in pact_block
-                    is_type = (pact_type in pact_block) if pact_type != "truce" else True # Truce doesn't have type field usually
-
-                    if is_target and is_type:
-                        change_made = True
-                        # Skip this block (don't append)
-                    else:
-                        new_inner_parts.append(inner_body[abs_start:be])
-                    cursor = be
-                else:
-                    new_inner_parts.append(inner_body[abs_start:])
-                    break
-
-            if change_made:
-                new_block = block[:header_len] + "".join(new_inner_parts) + "}"
-                content = content[:s] + new_block + content[e:]
-                with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(content)
-                self.log(f"[DIP] Removed {pact_type} with {clean_target} from {fname}", 'success')
-
+    @mod_operation
     def set_relations(self, tag, target, value):
         self.perform_auto_backup()
         dip_dir = os.path.join(self.mod_path, "common", "history", "diplomacy")
@@ -3458,7 +2737,7 @@ class Vic3Logic:
 
         entry = f"\t\tset_relations = {{ country = c:{clean_target} value = {value} }}"
 
-        if s:
+        if s is not None:
             block = content[s:e]
             # Remove existing relation to target
             # Regex: set_relations = { country = c:TARGET value = ... }
@@ -3469,7 +2748,7 @@ class Vic3Logic:
         else:
              # Create new block
             d_s, d_e = self.get_block_range_safe(content, "DIPLOMACY")
-            if d_s:
+            if d_s is not None:
                 new_block = f"\n\tc:{clean_tag} ?= {{\n{entry}\n\t}}"
                 content = content[:d_e-1] + new_block + "\n}" + content[d_e:]
             else:
@@ -3480,139 +2759,43 @@ class Vic3Logic:
 
     # --- MOD MANAGER LOGIC ---
     def copy_tree_content(self, src, dst):
-        """Recursively copies content of src folder to dst folder."""
-        if not os.path.exists(src):
-            self.log(f"[WARN] Source path does not exist: {src}", 'warn')
-            return
-        os.makedirs(dst, exist_ok=True)
-        for item in os.listdir(src):
-            s = os.path.join(src, item)
-            d = os.path.join(dst, item)
-            if os.path.isdir(s):
-                if not os.path.exists(d): os.makedirs(d)
-                self.copy_tree_content(s, d)
-            else:
-                shutil.copy2(s, d)
+        for source in sorted(Path(src).rglob('*')):
+            if source.is_file():
+                target = Path(dst)/source.relative_to(src)
+                if target.exists(): continue
+                target.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(source,target)
 
     def create_new_mod(self, name, location):
-        if not name or not location:
-            self.log("[ERROR] Mod name and location required.", 'error')
-            return False
-
-        mod_root = os.path.join(location, name)
-        if os.path.exists(mod_root):
-            self.log(f"[ERROR] Directory already exists: {mod_root}", 'error')
-            return False
-
-        try:
-            os.makedirs(mod_root)
-            meta_dir = os.path.join(mod_root, ".metadata")
-            os.makedirs(meta_dir)
-
-            metadata = {
-                "name" : name,
-                "id" : "",
-                "version" : "",
-                "supported_game_version" : "",
-                "short_description" : "",
-                "tags" : [],
-                "relationships" : [],
-                "game_custom_data" : {
-                    "multiplayer_synchronized" : True
-                }
-            }
-
-            with open(os.path.join(meta_dir, "metadata.json"), 'w') as f:
-                json.dump(metadata, f, indent=4)
-
-            self.log(f"[SUCCESS] Created new mod structure at {mod_root}", 'success')
-
-            self.set_mod_path(mod_root)
-            return True
-
-        except Exception as e:
-            self.log(f"[ERROR] Failed to create mod: {e}", 'error')
-            traceback.print_exc()
-            return False
+        name = name.strip()
+        if not name or name in ('.', '..') or re.search(r'[<>:"/\\|?*\x00-\x1f]', name) or name.endswith(('.', ' ')):
+            raise ValueError('Choose a valid folder name without slashes or reserved filename characters.')
+        if name.split('.')[0].upper() in {'CON','PRN','AUX','NUL',*[f'COM{i}' for i in range(1,10)],*[f'LPT{i}' for i in range(1,10)]}:
+            raise ValueError('This name is reserved by Windows.')
+        root = Path(location).expanduser().resolve() / name
+        if self.vanilla_path and root.is_relative_to(Path(self.vanilla_path).resolve()):
+            raise ValueError('Create mods outside the game installation.')
+        if root.exists(): raise ValueError('That folder already exists. Open it instead.')
+        root.mkdir(parents=True)
+        for rel in MOD_DIRECTORIES: (root / rel).mkdir(parents=True, exist_ok=True)
+        metadata = dict(name=name, id='', version='1.0.0', supported_game_version='1.15.*',
+                        short_description='', tags=[], relationships=[], game_custom_data=dict(multiplayer_synchronized=True))
+        atomic_text(root / '.metadata/metadata.json', json.dumps(metadata, indent=2, ensure_ascii=False)+'\n')
+        atomic_text(root / 'localization/english/v3mt_l_english.yml', 'l_english:\n', localization=True)
+        self.set_mod_path(str(root))
+        self.log(f'[SUCCESS] Created mod scaffold: {root}', 'success')
+        return True
 
     def copy_vanilla_files(self, vanilla_path, mod_path):
-        """Copies the list of necessary default files and folders from vanilla."""
-        if not vanilla_path or not os.path.exists(vanilla_path):
-            self.log("[ERROR] Vanilla path invalid or not set.", 'error')
-            return
-
-        # Handle 'game' subdirectory if user selected root install folder
-        game_dir = os.path.join(vanilla_path, "game")
-        if os.path.exists(game_dir):
-            base_src = game_dir
-        else:
-            base_src = vanilla_path
-
-        # List of items to copy. Tuple: (path, is_recursive)
-        # Note: localization/English/countries_l_english -> localization/english/countries_l_english.yml
-        # Note: common/character_templates* -> is_recursive=True
-
-        items = [
-            ("localization/english/countries_l_english.yml", False),
-            ("common/character_templates", True),
-            ("common/coat_of_arms", True),
-            ("common/country_definitions", True),
-            ("common/cultures", True),
-            ("common/strategic_regions", True),
-            ("common/history/buildings", True),
-            ("common/history/characters", True),
-            ("common/history/countries", True),
-            ("common/history/diplomacy", True),
-            ("common/history/military_formations", True),
-            ("common/history/pops", True),
-            ("common/history/population", True),
-            ("common/history/states", True),
-            ("common/history/trade", True),
-            ("common/history/treaties", True),
-            ("common/history/power_blocs", True),
-            ("common/history/lobbies/00_lobbies.txt", False),
-            ("common/religions", True),
-            ("common/journal_entries", True),
-            ("common/laws", True),
-            ("common/technology/technologies", True),
-            ("common/buildings", True),
-            ("map_data", True),
-            ("gfx/map/map_object_data", True)
-        ]
-
-        copied_count = 0
-        for rel_path, recursive in items:
-            # Handle potential case sensitivity or slight path variations manually if needed
-            # Assuming standard structure here.
-            src = os.path.join(base_src, rel_path)
-            dst = os.path.join(mod_path, rel_path)
-
-            if not os.path.exists(src):
-                # Try lower case for English path if failed
-                if "English" in rel_path or "english" in rel_path:
-                    alt_path = rel_path.replace("English", "english")
-                    src = os.path.join(base_src, alt_path)
-
-            if not os.path.exists(src):
-                self.log(f"[WARN] Skipped missing vanilla path: {rel_path}", 'warn')
-                continue
-
-            try:
-                if recursive:
-                    if os.path.isdir(src):
-                        self.copy_tree_content(src, dst)
-                        copied_count += 1
-                    else:
-                        self.log(f"[WARN] Expected folder but found file: {rel_path}", 'warn')
-                else:
-                    # File copy
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.copy2(src, dst)
-                    copied_count += 1
-            except Exception as e:
-                self.log(f"[ERROR] Failed to copy {rel_path}: {e}", 'error')
-
-        self.log(f"[SUCCESS] Copied {copied_count} items from vanilla.", 'success')
+        self.set_vanilla_path(vanilla_path)
+        self.set_mod_path(mod_path)
+        root=Path(self.vanilla_path)/'game'
+        # History is edited as a coordinated scenario; definitions remain live read-only fallbacks.
+        folders=['common/history','common/country_definitions','common/strategic_regions','map_data/state_regions']
+        for rel in folders:
+            if (root/rel).is_dir(): self.copy_tree_content(root/rel,Path(mod_path)/rel)
+        self.state_manager.load_state_regions()
+        self.log('[SUCCESS] Imported missing scenario files. Existing mod files were preserved.', 'success')
 
     def backup_mod(self, mod_path):
         """Creates a numbered backup of the current mod."""
@@ -3642,131 +2825,47 @@ class Vic3Logic:
             self.log(f"[ERROR] Backup failed: {e}", 'error')
 
     def perform_auto_backup(self):
-        """Creates or overwrites the auto-backup folder if enabled."""
-        if not self.auto_backup_enabled or not self.mod_path or not os.path.exists(self.mod_path):
-            return
-
-        parent_dir = os.path.dirname(self.mod_path)
-        mod_dirname = os.path.basename(self.mod_path)
-        backup_name = f"{mod_dirname}_autobackup"
-        backup_path = os.path.join(parent_dir, backup_name)
-
-        try:
-            # We want to replace contents. efficient way: rmtree then copytree
-            # Or copytree with dirs_exist_ok=True (Python 3.8+)
-            if os.path.exists(backup_path):
-                shutil.rmtree(backup_path)
-
-            shutil.copytree(self.mod_path, backup_path)
-            self.log(f"[AUTO-BACKUP] Updated {backup_name}", 'success')
-        except Exception as e:
-            self.log(f"[ERROR] Auto-backup failed: {e}", 'error')
+        if not self.auto_backup_enabled or not self.mod_path or getattr(self,'_backup_done',False): return
+        import zipfile
+        from datetime import datetime, timezone
+        root=Path(self.mod_path)
+        folder=root.parent/(root.name+'_backups'); folder.mkdir(exist_ok=True)
+        stamp=datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')
+        path=folder/f'{stamp}.zip'
+        with zipfile.ZipFile(path,'w',zipfile.ZIP_DEFLATED) as archive:
+            for file in sorted(root.rglob('*')):
+                if file.is_file() and not file.is_symlink(): archive.write(file,file.relative_to(root))
+        if getattr(self,'_operation_depth',0): self._backup_done=True
+        self.log(f'[BACKUP] Saved {path.name}', 'success')
 
     # --- RELIGION & CULTURE LOGIC ---
     def scan_culture_definitions(self):
-        """Scans mod common/cultures/*.txt for options."""
-        if not self.mod_path: return {}, [], [], [], [], []
-
-        heritages = set()
-        languages = set()
-        traditions = set()
-        graphics = set()
-        ethnicities = set()
-        culture_data = {}
-
-        cult_dir = os.path.join(self.mod_path, "common", "cultures")
-        if not os.path.exists(cult_dir): return {}, [], [], [], [], []
-
-        for root, _, files in os.walk(cult_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                fpath = os.path.join(root, file)
-                try:
-                    with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
-
-                cursor = 0
-                while True:
-                    m = re.search(r"^([a-z0-9_]+)\s*=\s*\{", content[cursor:], re.MULTILINE)
-                    if not m: break
-                    key = m.group(1)
-                    start = cursor + m.start()
-                    s, e = self.find_block_content(content, cursor + m.end() - 1)
-
-                    if s:
-                        block = content[s:e]
-                        h = re.search(r"heritage\s*=\s*([a-z0-9_]+)", block);
-                        if h: heritages.add(h.group(1))
-                        l = re.search(r"language\s*=\s*([a-z0-9_]+)", block);
-                        if l: languages.add(l.group(1))
-                        g = re.search(r"graphics\s*=\s*([a-z0-9_]+)", block);
-                        if g: graphics.add(g.group(1))
-
-                        tm = re.search(r"traditions\s*=\s*\{", block)
-                        if tm:
-                            ts, te = self.find_block_content(block, tm.end()-1)
-                            if ts:
-                                # Use inner content to avoid adding braces to list
-                                for t in block[ts+1:te-1].split():
-                                    t_clean = t.strip()
-                                    if t_clean and not t_clean.startswith("#"): traditions.add(t_clean)
-
-                        em = re.search(r"ethnicities\s*=\s*\{", block)
-                        if em:
-                            es, ee = self.find_block_content(block, em.end()-1)
-                            if es:
-                                for ematch in re.finditer(r"=\s*([a-z0-9_]+)", block[es:ee]): ethnicities.add(ematch.group(1))
-
-                        names = {}
-                        for list_name in ["male_common_first_names", "female_common_first_names", "noble_last_names", "common_last_names", "male_regal_first_names", "female_regal_first_names"]:
-                            lm = re.search(list_name + r"\s*=\s*\{", block)
-                            if lm:
-                                ls, le = self.find_block_content(block, lm.end()-1)
-                                # Store inner content only to avoid double bracing on save
-                                if ls: names[list_name] = block[ls+1:le-1].strip()
-                        culture_data[key] = names
-                        cursor = e
-                    else:
-                        cursor = start + 1
-
-        return culture_data, sorted(list(heritages)), sorted(list(languages)), sorted(list(traditions)), sorted(list(graphics)), sorted(list(ethnicities))
+        cultures={}; options={key:set() for key in ('heritage','language','traditions','graphics','ethnicities')}
+        names=('male_common_first_names','female_common_first_names','noble_last_names','common_last_names','male_regal_first_names','female_regal_first_names')
+        for path in self.effective_files('common/cultures'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,depth=0):
+                body=text[b['opening']+1:b['end']-1];data={}
+                for key in ('heritage','language','graphics'):
+                    if field(body,key): options[key].add(field(body,key))
+                for child in script_blocks(body,depth=0):
+                    raw=body[child['opening']+1:child['end']-1]
+                    if child['key'] in names:data[child['key']]=raw.strip()
+                    elif child['key']=='traditions':options['traditions'].update(t.strip('"') for t,_,_ in script_tokens(raw))
+                    elif child['key']=='ethnicities':options['ethnicities'].update(v[0].strip('"') for v in script_fields(raw).values())
+                cultures[b['key']]=data
+        return (cultures,*(sorted(options[key]) for key in ('heritage','language','traditions','graphics','ethnicities')))
 
     def scan_all_religions_and_heritages(self):
-        paths = []
-        if self.mod_path:
-             paths.append(os.path.join(self.mod_path, "common", "religions"))
+        religions=set();heritages=set()
+        for path in self.effective_files('common/religions'):
+            text=path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text,depth=0):
+                religions.add(b['key']);value=field(text[b['opening']+1:b['end']-1],'heritage')
+                if value:heritages.add(value)
+        return sorted(religions),sorted(heritages)
 
-        religions = set()
-        heritages = set()
-
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                    cursor = 0
-                    while True:
-                        m = re.search(r"^([a-z0-9_]+)\s*=\s*\{", content[cursor:], re.MULTILINE)
-                        if not m: break
-                        key = m.group(1)
-                        if key.lower() not in ["technically", "random"]: religions.add(key)
-
-                        start = cursor + m.start()
-                        s, e = self.find_block_content(content, cursor + m.end()-1)
-                        if s:
-                             h = re.search(r"heritage\s*=\s*([a-z0-9_]+)", content[s:e])
-                             if h: heritages.add(h.group(1))
-                             cursor = e
-                        else:
-                             cursor = start + 1
-        return sorted(list(religions)), sorted(list(heritages))
-
+    @mod_operation
     def save_new_culture(self, key, name, color, religion, heritage, language, traditions, graphics, ethnicities, name_data):
         self.perform_auto_backup()
         mod_name = os.path.basename(self.mod_path)
@@ -3805,9 +2904,12 @@ class Vic3Logic:
         # Append or Create
         mode = 'a' if os.path.exists(fpath) else 'w'
         try:
-            with open(fpath, mode, encoding='utf-8-sig') as f:
-                if mode == 'a': f.write("\n")
-                f.write(content_block)
+            current = Path(fpath).read_text(encoding='utf-8-sig') if Path(fpath).exists() else ''
+            blocks = script_blocks(current, key, 0)
+            if blocks:
+                b = blocks[0]; current = current[:b['start']] + content_block.strip() + current[b['end']:]
+            else: current += "\n" + content_block
+            atomic_text(fpath, current)
         except Exception as e:
             self.log(f"[ERROR] Failed to save culture: {e}", 'error')
             return
@@ -3820,11 +2922,11 @@ class Vic3Logic:
         if not os.path.exists(lpath):
              with open(lpath, 'w', encoding='utf-8-sig') as f: f.write("l_english:\n")
 
-        with open(lpath, 'a', encoding='utf-8-sig') as f:
-            f.write(f' {key}:0 "{name}"\n')
+        self._localize(Path(lpath).name.removesuffix('_l_english.yml'), {key: name})
 
         self.log(f"[SUCCESS] Saved culture {key}", 'success')
 
+    @mod_operation
     def save_new_religion(self, key, name, color, heritage, icon_path):
         self.perform_auto_backup()
         mod_name = os.path.basename(self.mod_path)
@@ -3845,9 +2947,12 @@ class Vic3Logic:
 """
         mode = 'a' if os.path.exists(fpath) else 'w'
         try:
-            with open(fpath, mode, encoding='utf-8-sig') as f:
-                if mode == 'a': f.write("\n")
-                f.write(content_block)
+            current = Path(fpath).read_text(encoding='utf-8-sig') if Path(fpath).exists() else ''
+            blocks = script_blocks(current, key, 0)
+            if blocks:
+                b = blocks[0]; current = current[:b['start']] + content_block.strip() + current[b['end']:]
+            else: current += "\n" + content_block
+            atomic_text(fpath, current)
         except Exception as e:
             self.log(f"[ERROR] Failed to save religion: {e}", 'error')
             return
@@ -3860,8 +2965,7 @@ class Vic3Logic:
         if not os.path.exists(lpath):
              with open(lpath, 'w', encoding='utf-8-sig') as f: f.write("l_english:\n")
 
-        with open(lpath, 'a', encoding='utf-8-sig') as f:
-            f.write(f' {key}:0 "{name}"\n')
+        self._localize(Path(lpath).name.removesuffix('_l_english.yml'), {key: name})
 
         self.log(f"[SUCCESS] Saved religion {key}", 'success')
 
@@ -4093,47 +3197,9 @@ class Vic3Logic:
         return name, adj
 
     def save_power_bloc_localization(self, key, name, adj):
-        self.perform_auto_backup()
-        loc_dir = os.path.join(self.mod_path, "localization", "english")
-        os.makedirs(loc_dir, exist_ok=True)
-        target_file = os.path.join(loc_dir, "mod_power_blocs_l_english.yml")
+        self._localize('mod_power_blocs', {key:name,key+'_adj':adj})
 
-        if not os.path.exists(target_file):
-            with open(target_file, 'w', encoding='utf-8-sig') as f: f.write("l_english:\n")
-
-        try:
-            with open(target_file, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(target_file, 'r', encoding='utf-8') as f: content = f.read()
-
-        # Escape quotes
-        safe_name = name.replace('"', '\\"')
-        safe_adj = adj.replace('"', '\\"')
-
-        # Update Name (key:0 "Value")
-        pattern = re.compile(r'^\s*' + re.escape(key) + r':\d?\s*".*"', re.MULTILINE)
-        new_line = f' {key}:0 "{safe_name}"'
-
-        if pattern.search(content):
-            content = pattern.sub(new_line, content)
-        else:
-            if not content.endswith("\n"): content += "\n"
-            content += new_line + "\n"
-
-        # Update Adjective (key_adj:0 "Value")
-        adj_key = f"{key}_adj"
-        pattern_adj = re.compile(r'^\s*' + re.escape(adj_key) + r':\d?\s*".*"', re.MULTILINE)
-        new_line_adj = f' {adj_key}:0 "{safe_adj}"'
-
-        if pattern_adj.search(content):
-            content = pattern_adj.sub(new_line_adj, content)
-        else:
-            if not content.endswith("\n"): content += "\n"
-            content += new_line_adj + "\n"
-
-        with open(target_file, 'w', encoding='utf-8-sig') as f: f.write(content)
-        self.log(f"[SAVE] Power Bloc localization saved to {target_file}", 'success')
-
+    @mod_operation
     def save_power_bloc_data(self, tag, data):
         """Saves power bloc data to history/global."""
         self.perform_auto_backup()
@@ -4178,7 +3244,8 @@ class Vic3Logic:
 
         princ_strs = [f"{p['key']}_{p['level']}" for p in principles_sorted]
 
-        principle_1 = princ_strs[0] if princ_strs else ""
+        if not princ_strs: raise ValueError("Choose at least one primary principle.")
+        principle_1 = princ_strs[0]
         extra_principles = princ_strs[1:] if len(princ_strs) > 1 else []
 
         map_col_str = data["map_color"]
@@ -4192,7 +3259,7 @@ class Vic3Logic:
             if m.replace("c:", "").strip() != clean_tag
         ]
 
-        members_str = "\n\t\t\t".join([f"member = {m}" for m in filtered_members])
+        members_str = "\n\t\t\t".join([f"member = c:{self.format_tag_clean(m)}" for m in filtered_members])
 
         create_block = f"""
 \t\tcreate_power_bloc = {{
@@ -4232,7 +3299,13 @@ class Vic3Logic:
             # Strategy: Replace the entire block content with our new content
             # Assuming the user only uses this file for power blocs as per vanilla structure.
 
-            new_inner = create_block + extra_block + "\n"
+            opening = block.find('{')
+            retained = block[opening+1:-1]
+            for child in reversed(script_blocks(retained, depth=0)):
+                raw = retained[child['start']:child['end']]
+                if child['key'] == 'create_power_bloc' or (child['key'] == 'if' and 'has_dlc_feature = power_bloc_features' in raw and 'add_principle' in raw):
+                    retained = retained[:child['start']] + retained[child['end']:]
+            new_inner = retained + create_block + extra_block + "\n"
             new_block = f"c:{clean_tag} ?= {{{new_inner}\t}}"
 
             content = content[:s] + new_block + content[e:]
@@ -4252,6 +3325,7 @@ class Vic3Logic:
         with open(target_file, 'w', encoding='utf-8-sig') as f: f.write(content)
         self.log(f"[SAVE] Power Bloc saved for {clean_tag}", 'success')
 
+    @mod_operation
     def remove_power_bloc(self, tag):
         """Removes power bloc definition for a tag."""
         self.perform_auto_backup()
@@ -4307,7 +3381,7 @@ class Vic3Logic:
                     abs_start = cursor + m.start()
                     s, e = self.find_block_content(new_content, cursor + m.end() - 1)
                     
-                    if s:
+                    if s is not None:
                         block = new_content[s:e]
                         if re.search(r"(owner|target|source)\s*=\s*c:" + re.escape(clean_tag) + r"\b", block, re.IGNORECASE):
                             new_parts.append(new_content[last_idx:abs_start])
@@ -4355,7 +3429,7 @@ class Vic3Logic:
                     abs_start = cursor + m.start()
                     s, e = self.find_block_content(new_content, cursor + m.end() - 1)
                     
-                    if s:
+                    if s is not None:
                         block = new_content[s:e]
                         if re.search(r"\bc:" + re.escape(clean_tag) + r"\b", block, re.IGNORECASE):
                             new_parts.append(new_content[last_idx:abs_start])
@@ -4371,300 +3445,94 @@ class Vic3Logic:
                     with open(fpath, 'w', encoding='utf-8-sig') as f: f.write("".join(new_parts))
                     self.log(f"   [CLEAN] Removed treaties for {clean_tag} in {file}")
 
-    def update_companies(self, source_tag, target_tag):
-        """Updates company ownership."""
-        clean_source = source_tag.replace("c:", "").strip()
-        clean_target = target_tag.replace("c:", "").strip()
-        
-        paths = [
-            os.path.join(self.mod_path, "common/history/buildings"),
-            os.path.join(self.mod_path, "common/history/companies")
-        ]
-        
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    fpath = os.path.join(root, file)
-                    try:
-                        with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
-                    
-                    new_content = content
-                    file_changed = False
-                    
-                    cursor = 0
-                    while True:
-                        m = re.search(r"company_type\s*=\s*\{", new_content[cursor:])
-                        if not m: break
-                        
-                        s, e = self.find_block_content(new_content, cursor + m.end() - 1)
-                        if s:
-                            block = new_content[s:e]
-                            if re.search(r"country\s*=\s*c:" + re.escape(clean_source) + r"\b", block, re.IGNORECASE):
-                                new_block = re.sub(r"(country\s*=\s*c:)" + re.escape(clean_source) + r"\b", r"\g<1>" + clean_target, block, flags=re.IGNORECASE)
-                                new_content = new_content[:s] + new_block + new_content[e:]
-                                file_changed = True
-                                cursor = s + len(new_block)
-                            else:
-                                cursor = e
-                        else:
-                            cursor = cursor + m.end()
-                            
-                    if file_changed:
-                        with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(new_content)
-                        self.log(f"   [UPDATE] Transferred companies in {file}")
+    def clean_annexed_relations(self, old_tag):
+        country = 'c:' + self.format_tag_clean(old_tag)
+        folder = Path(self.mod_path) / 'common/history/diplomacy'
+        for path in sorted(folder.rglob('*.txt')):
+            content = path.read_text(encoding='utf-8-sig')
+            edits = []
+            for wrapper in script_blocks(content, 'DIPLOMACY', 0):
+                start = wrapper['opening'] + 1
+                body = content[start:wrapper['end'] - 1]
+                for owner in script_blocks(body, depth=0):
+                    if not owner['key'].startswith('c:'):
+                        continue
+                    offset = start + owner['opening'] + 1
+                    effects = content[offset:start + owner['end'] - 1]
+                    for relation in script_blocks(effects, 'set_relations', 0):
+                        args = effects[relation['opening'] + 1:relation['end'] - 1]
+                        if owner['key'] == country or field(args, 'country') == country:
+                            edits.append((offset + relation['start'], offset + relation['end']))
+            for start, end in reversed(edits):
+                content = content[:start] + content[end:]
+            if edits:
+                atomic_text(path, content)
 
     def update_military_formations(self, source_tag, target_tag):
-        """Removes military formations of the annexed tag."""
-        clean_source = source_tag.replace("c:", "").strip()
-        path = os.path.join(self.mod_path, "common/history/military_formations")
-        if not os.path.exists(path): return
-        
-        for root, _, files in os.walk(path):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                fpath = os.path.join(root, file)
-                try:
-                    with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
-                
-                new_content = content
-                file_changed = False
-                
-                cursor = 0
-                new_parts = []
-                last_idx = 0
-                
-                while True:
-                    m = re.search(r"c:([A-Za-z0-9_]+)\s*(\?=|:|=)?\s*\{", new_content[cursor:])
-                    if not m: 
-                        new_parts.append(new_content[last_idx:])
-                        break
-                    
-                    tag = m.group(1)
-                    abs_start = cursor + m.start()
-                    s, e = self.find_block_content(new_content, cursor + m.end() - 1)
-                    
-                    if s:
-                        if tag.upper() == clean_source.upper():
-                            # Delete this block (don't append it)
-                            file_changed = True
-                            self.log(f"   [MIL] Removed formation for {tag} in {file}")
-                        else:
-                            new_parts.append(new_content[last_idx:e])
-                        
-                        cursor = e
-                        last_idx = e
-                    else:
-                        cursor = abs_start + 1
-                        
-                if file_changed:
-                    with open(fpath, 'w', encoding='utf-8-sig') as f: f.write("".join(new_parts))
+        source=self.format_tag_clean(source_tag); target=self.format_tag_clean(target_tag)
+        if source==target: return
+        allocate = self.transferred_names(target)
+        for path in sorted((Path(self.mod_path)/'common/history/military_formations').rglob('*.txt')):
+            text=path.read_text(encoding='utf-8-sig'); result=text
+            # Country-level retag preserves complete fleets, ship modifications and saved scopes.
+            for b in reversed(script_blocks(text,'c:'+source,1)):
+                body = text[b['opening']+1:b['end']-1]
+                for form in reversed(script_blocks(body, 'create_military_formation', 0)):
+                    start, end = form['opening']+1, form['end']-1
+                    inner = body[start:end]
+                    body = body[:start]+put_field(inner, 'name', quoted(allocate(field(inner, 'type'))))+body[end:]
+                result = result[:b['start']]+'c:'+target+text[b['start']+len(source)+2:b['opening']+1]+body+result[b['end']-1:]
+            if result!=text: atomic_text(path,result)
 
     def clean_transferred_state_references(self, transferred_states):
-        """
-        Repatriates invalid ownership references in building files that point to transferred states.
-        E.g. Change: region="TRANSFERRED_STATE" -> region="LOCAL_STATE"
-        And change owner to the local land owner (nationalization).
-        """
-        if not transferred_states: return
-        self.log(f"[CLEANUP] Removing references to {len(transferred_states)} transferred states in buildings...")
-
-        buildings_dir = os.path.join(self.mod_path, "common/history/buildings")
-        if not os.path.exists(buildings_dir): return
-
-        clean_states = [self.format_state_clean(s) for s in transferred_states]
-        # Use regex for checking if a region is in the list
-        bad_states_pattern = '|'.join(map(re.escape, clean_states))
-        bad_region_re = re.compile(r'region\s*=\s*"?((?:s:)?(?:' + bad_states_pattern + r'))"?', re.IGNORECASE)
-
-        for root, _, files in os.walk(buildings_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                filepath = os.path.join(root, file)
-
-                try:
-                    with open(filepath, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
-
-                file_modified = False
-
-                # We must parse s:STATE blocks to know the local context
-                new_file_parts = []
-                cursor = 0
-
-                while True:
-                    # Find s:STATE = { ... }
-                    m = re.search(r"s:(STATE_[A-Za-z0-9_]+)\s*=\s*\{", content[cursor:])
-                    if not m:
-                        new_file_parts.append(content[cursor:])
-                        break
-
-                    abs_start = cursor + m.start()
-                    # Append everything before this block
-                    new_file_parts.append(content[cursor:abs_start])
-
-                    local_state = m.group(1)
-                    s_idx, e_idx = self.find_block_content(content, cursor + m.end() - 1)
-
-                    if s_idx:
-                        # Inside State Block
-                        state_content = content[abs_start:e_idx]
-
-                        # We need to find region_state:TAG to know the local owner
-                        # But multiple region_state blocks can exist.
-                        # We need to iterate region_state blocks inside the state block.
-
-                        new_state_parts = []
-                        st_cursor = 0
-                        # header "s:STATE = {"
-                        st_header_len = s_idx - abs_start + 1
-                        new_state_parts.append(state_content[:st_header_len])
-                        st_cursor = st_header_len
-                        st_inner_end = len(state_content) - 1 # exclude closing brace
-
-                        st_inner = state_content[st_header_len:-1]
-
-                        # Parse region_state blocks inside state
-                        inner_cursor = 0
-                        while True:
-                            rm = re.search(r"region_state:([A-Za-z0-9_:]+)\s*=\s*\{", st_inner[inner_cursor:], re.IGNORECASE)
-                            if not rm:
-                                new_state_parts.append(st_inner[inner_cursor:])
-                                break
-
-                            r_abs_start = inner_cursor + rm.start()
-                            new_state_parts.append(st_inner[inner_cursor:r_abs_start])
-
-                            land_owner_tag = self.format_tag_clean(rm.group(1)) # Extract TAG from region_state:TAG
-
-                            rs_s, rs_e = self.find_block_content(st_inner, inner_cursor + rm.end() - 1)
-
-                            if rs_s:
-                                rs_block = st_inner[r_abs_start:rs_e]
-
-                                # Process create_building entries inside region_state
-                                # We scan for add_ownership blocks
-                                # We need to iterate properly to handle multiple buildings
-
-                                # To avoid complexity, we can use regex replacement on the rs_block
-                                # IF we are confident we are inside add_ownership.
-                                # But we also need to change 'country = ...' to 'country = c:LAND_OWNER' IF we change the region.
-
-                                # Let's parse create_building blocks
-                                new_rs_parts = []
-                                rs_inner_cursor = 0
-                                # rs_block header
-                                rs_header_len = (rs_s - r_abs_start) + 1
-                                new_rs_parts.append(rs_block[:rs_header_len])
-                                rs_body = rs_block[rs_header_len:-1]
-
-                                b_cursor = 0
-                                while True:
-                                    bm = re.search(r"create_building\s*=\s*\{", rs_body[b_cursor:])
-                                    if not bm:
-                                        new_rs_parts.append(rs_body[b_cursor:])
-                                        break
-
-                                    b_start = b_cursor + bm.start()
-                                    new_rs_parts.append(rs_body[b_cursor:b_start])
-
-                                    bs_s, bs_e = self.find_block_content(rs_body, b_cursor + bm.end() - 1)
-
-                                    if bs_s:
-                                        b_full = rs_body[b_start:bs_e]
-                                        b_inner = rs_body[bs_s+1:bs_e-1]
-
-                                        # Detect Building Type
-                                        b_type = "building_financial_district" # Default
-                                        tm = re.search(r'building\s*=\s*"?([A-Za-z0-9_]+)"?', b_inner)
-                                        if tm: b_type = tm.group(1)
-
-                                        # Check add_ownership
-                                        am = re.search(r"add_ownership\s*=\s*\{", b_inner)
-                                        if am:
-                                            as_s, as_e = self.find_block_content(b_inner, am.end() - 1)
-                                            if as_s:
-                                                ao_content = b_inner[as_s+1:as_e-1]
-
-                                                # Parse individual ownership entries (building = { ... } or country = { ... })
-                                                new_ao_parts = []
-                                                ao_cursor = 0
-                                                ao_modified = False
-
-                                                while True:
-                                                    em = re.search(r"(building|country)\s*=\s*\{", ao_content[ao_cursor:])
-                                                    if not em:
-                                                        new_ao_parts.append(ao_content[ao_cursor:])
-                                                        break
-
-                                                    e_start = ao_cursor + em.start()
-                                                    new_ao_parts.append(ao_content[ao_cursor:e_start])
-
-                                                    es_s, es_e = self.find_block_content(ao_content, ao_cursor + em.end() - 1)
-                                                    if es_s:
-                                                        entry_block = ao_content[e_start:es_e]
-                                                        entry_inner = ao_content[es_s+1:es_e-1]
-
-                                                        # Check if region is bad
-                                                        if bad_region_re.search(entry_inner):
-                                                            # Extract Level
-                                                            lvl = 1
-                                                            lm = re.search(r"levels?\s*=\s*(\d+)", entry_inner)
-                                                            if lm: lvl = int(lm.group(1))
-
-                                                            # Generate new valid entry (Nationalize to Land Owner)
-                                                            new_entry = "\n\t\t\t\t\t" + self.get_ownership_content(b_type, land_owner_tag, lvl, local_state)
-                                                            new_ao_parts.append(new_entry)
-                                                            ao_modified = True
-                                                            file_modified = True
-                                                        else:
-                                                            new_ao_parts.append(entry_block)
-
-                                                        ao_cursor = es_e
-                                                    else:
-                                                        new_ao_parts.append(ao_content[e_start:])
-                                                        break # Parsing error
-
-                                                if ao_modified:
-                                                    new_ao_block = "add_ownership = {" + "".join(new_ao_parts) + "}"
-                                                    new_b_inner = b_inner[:am.start()] + new_ao_block + b_inner[as_e:]
-                                                    new_b_full = b_full[:bs_s-b_start+1] + new_b_inner + "}"
-                                                    new_rs_parts.append(new_b_full)
-                                                else:
-                                                    new_rs_parts.append(b_full)
-                                            else:
-                                                new_rs_parts.append(b_full)
-                                        else:
-                                            new_rs_parts.append(b_full)
-
-                                        b_cursor = bs_e
-                                    else:
-                                        new_rs_parts.append(rs_body[b_start:])
-                                        break
-
-                                new_rs_parts.append("}") # Close region_state
-                                new_state_parts.append("".join(new_rs_parts))
-                                inner_cursor = rs_e
+        """Correct only ownership seats whose country lost its part of a moved state."""
+        moved = {self.normalize_state_key(state) for state in transferred_states}
+        owned = {}
+        for path in self.effective_files('common/history/states'):
+            text = path.read_text(encoding='utf-8-sig')
+            for state in script_blocks(text):
+                if not (state['key'] or '').startswith('s:STATE_'):
+                    continue
+                body = text[state['opening']+1:state['end']-1]
+                for creation in script_blocks(body, 'create_state', 0):
+                    tag = field(body[creation['opening']+1:creation['end']-1], 'country').removeprefix('c:')
+                    owned.setdefault(tag, set()).add(state['key'][2:])
+        for path in (Path(self.mod_path)/'common/history/buildings').rglob('*.txt'):
+            text = path.read_text(encoding='utf-8-sig')
+            edits = []
+            for state in script_blocks(text):
+                if not (state['key'] or '').startswith('s:STATE_'):
+                    continue
+                start = state['opening']+1
+                body = text[start:state['end']-1]
+                for local in script_blocks(body, depth=0):
+                    if not (local['key'] or '').startswith('region_state:'):
+                        continue
+                    offset = start+local['opening']+1
+                    buildings = text[offset:start+local['end']-1]
+                    for ownership in script_blocks(buildings, 'add_ownership'):
+                        base = offset+ownership['opening']+1
+                        shares = text[base:offset+ownership['end']-1]
+                        for entry in script_blocks(shares, depth=0):
+                            i,j = base+entry['opening']+1,base+entry['end']-1
+                            share = text[i:j]
+                            seat = field(share,'region').removeprefix('s:')
+                            owner = field(share,'country').removeprefix('c:')
+                            if not owner or seat not in moved or seat in owned.get(owner, set()):
+                                continue
+                            local_tag = local['key'].split(':',1)[1]
+                            if owned.get(owner):
+                                seat = sorted(owned[owner])[0]
+                            elif state['key'][2:] in owned.get(local_tag,set()):
+                                seat = state['key'][2:]
+                                share = put_field(share,'country',quoted('c:'+local_tag))
                             else:
-                                new_state_parts.append(st_inner[r_abs_start:])
-                                break
-
-                        new_state_parts.append("}") # Close s:STATE
-                        new_file_parts.append("".join(new_state_parts))
-                        cursor = e_idx
-                    else:
-                        new_file_parts.append(content[cursor:cursor+1])
-                        cursor += 1
-
-                if file_modified:
-                    with open(filepath, 'w', encoding='utf-8-sig') as f: f.write("".join(new_file_parts))
-                    self.log(f"   [CLEANUP] Repatriated invalid ownerships in {file}")
+                                continue
+                            edits.append((i,j,put_field(share,'region',quoted(seat))))
+            for i,j,value in reversed(edits):
+                text = text[:i]+value+text[j:]
+            if edits:
+                atomic_text(path,text)
 
     def sanitize_buildings(self, old_tag, target_tag, transferred_states):
         self.perform_auto_backup()
@@ -4850,6 +3718,7 @@ class Vic3Logic:
                         return fpath, list(set(homelands)) # unique
         return None, []
 
+    @mod_operation
     def save_state_homelands(self, state_name, homelands_list):
         self.perform_auto_backup()
         clean_state = self.format_state_clean(state_name)
@@ -4941,153 +3810,37 @@ class Vic3Logic:
         result.sort(key=lambda x: x['size'], reverse=True)
         return result, total
 
+    @mod_operation
     def save_state_demographics(self, state, region_tag, demographic_data, total_pop, retain_location=False):
-        # 1. Get current pops to locate files & calculate owner shares
-        current_pops = self.get_state_pops(state)
-
-        owner_shares = {}
-        target_pops = current_pops
-        clean_tag = None
-
-        if region_tag:
-            clean_tag = region_tag.replace("c:", "").upper()
-            target_pops = [p for p in current_pops if p['region_tag'].upper() == clean_tag]
-            owner_shares[clean_tag] = 1.0
-        else:
-            # Full State: Calculate shares
-            owner_totals = {}
-            grand_total = 0
-            for p in current_pops:
-                t = p['region_tag'].upper()
-                if t not in owner_totals: owner_totals[t] = 0
-                owner_totals[t] += p['size']
-                grand_total += p['size']
-
-            if grand_total > 0:
-                for t, size in owner_totals.items():
-                    owner_shares[t] = size / grand_total
-            else:
-                # Fallback scan if empty
-                owners = self.scan_state_region_owners(state)
-                if owners:
-                    share = 1.0 / len(owners)
-                    for o in owners:
-                        owner_shares[o.replace("c:","").upper()] = share
-
-        # 2. Remove existing pops
-        files_map = {}
-        for p in target_pops:
-            files_map[p['file']] = True
-
-        for fpath in files_map:
-            # Ensure it is in mod
-            target_path = fpath
-            if self.vanilla_path and fpath.startswith(self.vanilla_path):
-                mod_rel = os.path.relpath(fpath, os.path.join(self.vanilla_path, "game"))
-                target_path = os.path.join(self.mod_path, mod_rel)
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                if not os.path.exists(target_path):
-                    shutil.copy2(fpath, target_path)
-
-            try:
-                with open(target_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-            except:
-                with open(target_path, 'r', encoding='utf-8') as f: content = f.read()
-
-            content = self._remove_pops_from_text(content, state, clean_tag)
-            with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
-
-        # 3. Add new pops
-        dest_file = None
-        if files_map:
-            first_f = list(files_map.keys())[0]
-            if self.vanilla_path and first_f.startswith(self.vanilla_path):
-                mod_rel = os.path.relpath(first_f, os.path.join(self.vanilla_path, "game"))
-                dest_file = os.path.join(self.mod_path, mod_rel)
-            else:
-                dest_file = first_f
-        else:
-            dest_file = os.path.join(self.mod_path, "common/history/pops/99_mod_pops.txt")
-            os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-            if not os.path.exists(dest_file):
-                with open(dest_file, 'w', encoding='utf-8-sig') as f: f.write("POPS = {\n}")
-
-        try:
-            with open(dest_file, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(dest_file, 'r', encoding='utf-8') as f: content = f.read()
-
-        # Iterate owners and inject
-        for owner_tag, share in owner_shares.items():
-            owner_total = int(total_pop * share)
-            if owner_total <= 0: continue
-
-            # Determine existing demographics for this owner if retain_location is on
-            existing_demos = set()
-            if retain_location:
-                # Need to scan this specific region_state in the FILE content (or existing target_pops if accurate)
-                # target_pops has list of pops. We can filter by owner_tag.
-                # However, target_pops might only cover region_tag if provided.
-                # If we are doing full state, we need to look at current_pops.
-                for p in current_pops:
-                    if p['region_tag'].upper() == owner_tag.upper():
-                        existing_demos.add((p['culture'], p['religion']))
-
-            new_pops_str = ""
-            for d in demographic_data:
-                pct = d['percent']
-                # Round logic handled by mixer, but backend should respect tiny values?
-                # If pct is 0, skip.
-                if pct <= 0: continue
-
-                # Retain Location Check
-                if retain_location:
-                    # If this combo didn't exist for this owner, skip it
-                    if (d['culture'], d['religion']) not in existing_demos:
-                        continue
-
-                size = int((pct / 100.0) * owner_total)
-                if size <= 0: continue
-
-                new_pops_str += f"""
-		create_pop = {{
-			culture = {d['culture']}
-			religion = {d['religion']}
-			size = {size}
-		}}"""
-
-            if not new_pops_str: continue
-
-            # Inject for this owner
-            s, e = self.get_block_range_safe(content, f"s:{state}")
-            if s is not None:
-                state_block = content[s:e]
-                rs_pat = re.compile(r"region_state:" + re.escape(owner_tag) + r"\s*=\s*\{")
-                m = rs_pat.search(state_block)
-
-                if m:
-                    # Insert inside existing region_state
-                    rs_s, rs_e = self.find_block_content(state_block, m.end()-1)
-                    if rs_s:
-                        # Append to end of region_state block
-                        new_rs_block = state_block[m.start():rs_e-1] + new_pops_str + "\n\t\t}"
-                        state_block = state_block[:m.start()] + new_rs_block + state_block[rs_e:]
-                        content = content[:s] + state_block + content[e:]
-                else:
-                    # Create region_state
-                    new_rs = f"\n\t\tregion_state:{owner_tag} = {{\n{new_pops_str}\n\t\t}}"
-                    state_block = state_block[:state_block.rfind('}')] + new_rs + "\n\t}"
-                    content = content[:s] + state_block + content[e:]
-            else:
-                # Create state block
-                new_entry = f"\n\ts:{state} = {{\n\t\tregion_state:{owner_tag} = {{\n{new_pops_str}\n\t\t}}\n\t}}"
-                ps, pe = self.get_block_range_safe(content, "POPS")
-                if ps is not None:
-                    content = content[:pe-1] + new_entry + "\n}" + content[pe:]
-                else:
-                    content += f"\nPOPS = {{{new_entry}\n}}"
-
-        with open(dest_file, 'w', encoding='utf-8-sig') as f: f.write(content)
+        state=self.normalize_state_key(state); total=nonnegative(total_pop,'Population')
+        pops=self.get_state_pops(state); owner=self.format_tag_clean(region_tag) if region_tag else None
+        targets=[p for p in pops if not owner or p['region_tag']==owner]
+        shares={}
+        for pop in targets: shares[pop['region_tag']]=shares.get(pop['region_tag'],0)+pop['size']
+        if not shares:
+            owners=[owner] if owner else [self.format_tag_clean(t) for t in self.scan_state_region_owners(state)]
+            shares={tag:1 for tag in owners}
+        if not shares: raise ValueError('State has no owner. Set ownership first.')
+        demos=[]
+        for d in demographic_data:
+            weight=float(d['percent'])
+            if not math.isfinite(weight) or weight<0: raise ValueError('Demographic percentages must be finite and non-negative.')
+            if weight: demos.append((identifier(d['culture']),identifier(d['religion']) if d['religion'] else '',weight))
+        if total and not demos: raise ValueError('Add a demographic group before replacing the population.')
+        plans=[]
+        for tag,size in zip(shares,apportion(total,list(shares.values()))):
+            available={(p['culture'],p['religion']) for p in targets if p['region_tag']==tag}
+            eligible=[d for d in demos if not retain_location or d[:2] in available]
+            if size and not eligible: raise ValueError(f'No selected demographic exists in {tag}; change the mix or disable Retain location.')
+            for d,count in zip(eligible,apportion(size,[d[2] for d in eligible])):
+                if count: plans.append((tag,d[0],d[1],count))
+        # All validation and allocation happens before removing existing pops.
+        for source in sorted({p['file'] for p in targets}):
+            target=self._editable_copy(Path(source)); text=target.read_text(encoding='utf-8-sig')
+            atomic_text(target,self._remove_pops_from_text(text,state,owner))
+        destination=Path(self.mod_path)/'common/history/pops/99_v3mt_demographics.txt'
+        if not destination.exists(): atomic_text(destination,'POPS = {\n}\n')
+        for tag,culture,religion,size in plans: self.add_pop_to_file(str(destination),state,tag,culture,religion,size)
 
     def _remove_pops_from_text(self, content, state, tag):
         cursor = 0
@@ -5156,265 +3909,44 @@ class Vic3Logic:
         return content
 
     def get_state_pops(self, state_name):
-        clean_state = self.format_state_clean(state_name)
-        if not clean_state: return []
+        state=self.normalize_state_key(state_name); result=[]
+        for path in self.effective_files('common/history/pops'):
+            text=path.read_text(encoding='utf-8-sig')
+            for st in script_blocks(text,'s:'+state):
+                start=st['opening']+1; body=text[start:st['end']-1]
+                for owner in script_blocks(body,depth=0):
+                    if not owner['key'] or not owner['key'].startswith('region_state:'): continue
+                    tag=owner['key'].split(':',1)[1]; offset=start+owner['opening']+1; inner=text[offset:start+owner['end']-1]
+                    for pop in script_blocks(inner,'create_pop',0):
+                        a=offset+pop['opening']+1; b=offset+pop['end']-1; raw=text[a:b]
+                        result.append(dict(file=str(path),state=state,region_tag=tag,culture=field(raw,'culture'),religion=field(raw,'religion'),size=int(field(raw,'size','0')),
+                            indices=dict(pop_content_start=a,pop_content_end=b),snapshot=raw))
+        return result
 
-        # Scan mod folder only? Or vanilla too? Usually we edit what's active.
-        # If user wants to edit vanilla pops, we might need to copy file first.
-        # But 'pops' logic is usually split.
-        # For simplicity, we scan mod + vanilla, but if we edit a vanilla pop, we need to handle file copying.
-
-        pop_dirs = []
-        if self.mod_path: pop_dirs.append(os.path.join(self.mod_path, "common/history/pops"))
-        if self.vanilla_path: pop_dirs.append(os.path.join(self.vanilla_path, "game/common/history/pops"))
-
-        pops = [] # list of dicts
-        processed_files = set() # Relative paths in mod to avoid duplicates
-
-        for p_dir in pop_dirs:
-            if not os.path.exists(p_dir): continue
-            is_mod_file = self.mod_path in p_dir
-
-            for root, _, files in os.walk(p_dir):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    fpath = os.path.join(root, file)
-
-                    # Deduplication logic
-                    rel_path = os.path.relpath(fpath, p_dir)
-                    if is_mod_file:
-                        processed_files.add(rel_path)
-                    else:
-                        if rel_path in processed_files:
-                            continue
-
-                    try:
-                        with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
-
-                    # Find s:STATE
-                    # Note: Need to loop as regex findall doesn't give block contents easily for nested stuff
-                    cursor = 0
-                    while True:
-                        s, e = self.get_block_range_safe(content, f"s:{clean_state}", cursor)
-                        if s is None: break
-
-                        state_block = content[s:e]
-                        state_inner_start = content.find('{', s) + 1
-
-                        # Find region_state:TAG inside
-                        rs_cursor = 0
-                        while True:
-                            # Update regex to handle optional c: prefix
-                            m_rs = re.search(r"region_state:(?:c:)?([A-Za-z0-9_]+)\s*=\s*\{", state_block[rs_cursor:])
-                            if not m_rs: break
-
-                            tag = m_rs.group(1)
-                            rs_abs_start = rs_cursor + m_rs.start()
-                            rs_s, rs_e = self.find_block_content(state_block, rs_cursor + m_rs.end() - 1)
-
-                            if rs_s:
-                                rs_block = state_block[rs_s:rs_e]
-                                # Find create_pop inside
-                                cp_cursor = 0
-                                while True:
-                                    m_cp = re.search(r"create_pop\s*=\s*\{", rs_block[cp_cursor:])
-                                    if not m_cp: break
-
-                                    cp_s, cp_e = self.find_block_content(rs_block, cp_cursor + m_cp.end() - 1)
-                                    if cp_s:
-                                        cp_inner = rs_block[cp_s:cp_e]
-
-                                        # Extract values
-                                        cul = re.search(r"culture\s*=\s*\"?([A-Za-z0-9_]+)\"?", cp_inner)
-                                        rel = re.search(r"religion\s*=\s*\"?([A-Za-z0-9_]+)\"?", cp_inner)
-                                        size = re.search(r"size\s*=\s*(\d+)", cp_inner)
-
-                                        if cul and size:
-                                            # Calculate absolute file indices for the pop block start/end
-                                            # This is tricky due to nesting relative offsets
-                                            # File -> s:STATE (s) -> region_state (rs_s relative to s) -> create_pop (cp_s relative to rs_s)
-                                            # Wait, block ranges are indices into the string passed.
-
-                                            # s is index in 'content'
-                                            # rs_s is index in 'state_block' (which starts at s) -> abs = s + rs_s
-                                            # cp_s is index in 'rs_block' (which starts at s + rs_s) -> abs = s + rs_s + cp_s
-
-                                            # Actually find_block_content returns indices relative to the text string provided.
-                                            # state_block = content[s:e].
-                                            # rs_s, rs_e are indices within state_block.
-
-                                            abs_start = s + rs_s + cp_s - len("create_pop = {") # Approx? No, find_block_content gives content inside braces.
-                                            # We need the whole block range including "create_pop = { }" to replace it?
-                                            # Or just identifying info.
-
-                                            # Let's verify find_block_content return values.
-                                            # It returns start (opening brace) and end (closing brace + 1) index.
-
-                                            # To update a pop, we need to uniquely identify it.
-                                            # File path + index is good.
-
-                                            # Correct offsets:
-                                            # rs_start_in_state = rs_s (start of inner content)
-                                            # cp_start_in_rs = cp_s (start of inner content of pop)
-
-                                            # We want the start of "create_pop = {" line effectively.
-                                            # Let's store the index of the opening brace of the pop block in the file.
-
-                                            # s: start of state block opening brace (roughly) in content.
-                                            # content[s:e] is "s:STATE = { ... }"
-                                            # Actually get_block_range_safe returns match.start() (start of "s:STATE") and end brace pos.
-
-                                            # s = start of "s:STATE"
-                                            # state_block = content[s:e]
-
-                                            # rs_match in state_block. rs_abs_start relative to state_block.
-                                            # rs_s, rs_e = inner content indices relative to state_block.
-
-                                            # cp_match in rs_block (which is state_block[rs_s:rs_e]).
-                                            # cp_s, cp_e relative to rs_block.
-
-                                            # Real file index of pop content start = s + rs_s + cp_s
-
-                                            # Store identifying info
-                                            pops.append({
-                                                "file": fpath,
-                                                "is_mod": is_mod_file,
-                                                "region_tag": tag,
-                                                "culture": cul.group(1),
-                                                "religion": rel.group(1) if rel else "",
-                                                "size": int(size.group(1)),
-                                                # Use a simple signature to find it later instead of fragile indices?
-                                                # Or regex match nth occurrence?
-                                                # Indices are best if we don't modify file in between.
-                                                "indices": {
-                                                    "state_block_start": s,
-                                                    "rs_content_start": s + rs_s,
-                                                    "pop_content_start": s + rs_s + cp_s,
-                                                    "pop_content_end": s + rs_s + cp_e
-                                                }
-                                            })
-
-                                        cp_cursor = cp_e
-                                    else:
-                                        cp_cursor += 1
-                                rs_cursor = rs_e
-                            else:
-                                rs_cursor += 1
-
-                        cursor = e
-
-        return pops
-
+    @mod_operation
     def save_state_pops_total(self, state_name, new_total, pop_data_list):
-        # 1. Calculate proportional distribution
-        current_total = sum(p['size'] for p in pop_data_list)
-        if current_total == 0: return
+        sizes=apportion(new_total,[p['size'] for p in pop_data_list])
+        grouped={}
+        for pop,size in zip(pop_data_list,sizes): grouped.setdefault(pop['file'],[]).append((pop,size))
+        for source,entries in grouped.items():
+            target=self._editable_copy(Path(source)); text=target.read_text(encoding='utf-8-sig')
+            for pop,size in sorted(entries,key=lambda x:x[0]['indices']['pop_content_start'],reverse=True):
+                a,b=pop['indices']['pop_content_start'],pop['indices']['pop_content_end']
+                if 'snapshot' not in pop or text[a:b]!=pop['snapshot']: raise ValueError('Population changed since loading. Reload before editing.')
+                text=text[:a]+put_field(text[a:b],'size',size)+text[b:]
+            atomic_text(target,text)
 
-        ratio = new_total / current_total
-        running_total = 0
-
-        # Apply changes to data objects first
-        for i, p in enumerate(pop_data_list):
-            if i == len(pop_data_list) - 1:
-                # Last pop takes the remainder to ensure exact match
-                p['size'] = int(new_total - running_total)
-            else:
-                new_size = int(p['size'] * ratio)
-                p['size'] = new_size
-                running_total += new_size
-
-            if p['size'] < 0: p['size'] = 0
-
-        # 2. Group by file to minimize open/close
-        files_map = {}
-        for p in pop_data_list:
-            if p['file'] not in files_map: files_map[p['file']] = []
-            files_map[p['file']].append(p)
-
-        # 3. Process each file
-        for fpath, pops in files_map.items():
-            # Check if we need to copy to mod directory
-            target_path = fpath
-            if self.vanilla_path and fpath.startswith(self.vanilla_path):
-                # Copy to mod
-                mod_rel = os.path.relpath(fpath, os.path.join(self.vanilla_path, "game"))
-                target_path = os.path.join(self.mod_path, mod_rel)
-                os.makedirs(os.path.dirname(target_path), exist_ok=True)
-                if not os.path.exists(target_path):
-                    shutil.copy2(fpath, target_path)
-
-            # Read (possibly new) file
-            try:
-                with open(target_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-            except:
-                with open(target_path, 'r', encoding='utf-8') as f: content = f.read()
-
-            # We must apply changes from bottom to top to preserve indices!
-            # Sort pops by index descending
-            pops.sort(key=lambda x: x['indices']['pop_content_start'], reverse=True)
-
-            for p in pops:
-                # If we moved file (vanilla -> mod), indices might be same if copied exactly.
-                # However, if we are processing multiple pops in the same file, updating one shifts indices of others.
-                # BUT since we sort reverse, the 'start' indices of earlier pops remain valid.
-
-                # Re-verify/Find block
-                # Since content might be different if we copied vanilla file? No, it's a copy.
-                # But to be safe, let's use the indices relative to the logic we scanned.
-
-                # Limitation: 'indices' are from the scan of 'fpath'. If 'target_path' is different (copy), content is same.
-                # But if we modify the content for pop N, pop N-1's indices are fine.
-
-                s = p['indices']['pop_content_start']
-                e = p['indices']['pop_content_end']
-
-                # Extract the exact block to ensure we match
-                # (Safety check: does content[s:e] look like the pop?)
-                # Actually, we just need to replace the 'size = X' line inside the block content[s:e]
-
-                block_inner = content[s:e]
-                new_inner = re.sub(r"size\s*=\s*\d+", f"size = {p['size']}", block_inner)
-
-                content = content[:s] + new_inner + content[e:]
-
-            with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
-            self.log(f"[POPS] Updated total population in {os.path.basename(target_path)}", 'success')
-
+    @mod_operation
     def save_single_pop(self, pop_entry, new_culture, new_religion, new_size):
-        # Similar logic to above but for one entry
-        fpath = pop_entry['file']
-        target_path = fpath
-
-        # Copy logic
-        if self.vanilla_path and fpath.startswith(self.vanilla_path):
-            mod_rel = os.path.relpath(fpath, os.path.join(self.vanilla_path, "game"))
-            target_path = os.path.join(self.mod_path, mod_rel)
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            if not os.path.exists(target_path):
-                shutil.copy2(fpath, target_path)
-
-        try:
-            with open(target_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(target_path, 'r', encoding='utf-8') as f: content = f.read()
-
-        s = pop_entry['indices']['pop_content_start']
-        e = pop_entry['indices']['pop_content_end']
-
-        block_inner = content[s:e]
-
-        # Replace values
-        new_inner = block_inner
-        new_inner = re.sub(r"culture\s*=\s*[A-Za-z0-9_]+", f"culture = {new_culture}", new_inner)
-        new_inner = re.sub(r"religion\s*=\s*[A-Za-z0-9_]+", f"religion = {new_religion}", new_inner)
-        new_inner = re.sub(r"size\s*=\s*\d+", f"size = {new_size}", new_inner)
-
-        content = content[:s] + new_inner + content[e:]
-
-        with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
-        self.log(f"[POPS] Updated single pop in {os.path.basename(target_path)}", 'success')
+        size=nonnegative(new_size,'Population')
+        culture=identifier(new_culture,'Culture'); religion=identifier(new_religion,'Religion') if new_religion else ''
+        source=Path(pop_entry['file']); target=self._editable_copy(source)
+        text=target.read_text(encoding='utf-8-sig'); a=pop_entry['indices']['pop_content_start']; b=pop_entry['indices']['pop_content_end']
+        old=text[a:b]
+        if 'snapshot' not in pop_entry or old!=pop_entry['snapshot']: raise ValueError('Population changed since loading. Reload before editing.')
+        new=put_field(put_field(old,'culture',culture),'size',size)
+        if religion: new=put_field(new,'religion',religion)
+        atomic_text(target,text[:a]+new+text[b:])
 
     def get_country_total_pop(self, tag):
         clean_tag = tag.replace("c:", "").strip()
@@ -5518,6 +4050,7 @@ class Vic3Logic:
 
         return total, state_pops_map
 
+    @mod_operation
     def set_country_total_pop(self, tag, new_total):
         current_total, state_pops_map = self.get_country_total_pop(tag)
         if current_total == 0: return
@@ -5548,6 +4081,7 @@ class Vic3Logic:
         for p in pops:
             self.save_single_pop(p, new_culture, p['religion'], p['size'])
 
+    @mod_operation
     def convert_country_identity(self, tag, new_culture, new_religion, mode, value_str=None):
         self.perform_auto_backup()
         owned_states = self.get_all_owned_states(tag)
@@ -5584,6 +4118,8 @@ class Vic3Logic:
             for p in my_pops: p['state'] = state
             pops_to_process.extend(my_pops)
 
+        if not pops_to_process:
+            raise ValueError(f"No starting pops found for {clean_tag}. Check state ownership and imported pop history.")
         # Group by File
         files_map = {}
         for p in pops_to_process:
@@ -5618,24 +4154,11 @@ class Vic3Logic:
                 has_religion = bool(p.get('religion'))
 
                 if mode == "full":
-                    c = new_culture if new_culture else p['culture']
-                    r = new_religion if new_religion else p['religion']
-                    # Use block replacement
                     block = content[s:e]
-                    if new_culture: block = re.sub(r"culture\s*=\s*[A-Za-z0-9_]+", f"culture = {c}", block)
-
+                    if new_culture:
+                        block = put_field(block, 'culture', identifier(new_culture))
                     if new_religion:
-                        if re.search(r"religion\s*=\s*[A-Za-z0-9_]+", block):
-                            block = re.sub(r"religion\s*=\s*[A-Za-z0-9_]+", f"religion = {r}", block)
-                        else:
-                            # Inject religion if missing
-                            # Insert before closing brace or after size/culture
-                            # Simple approach: append before }
-                            # Need to be careful with formatting
-                            last_brace = block.rfind('}')
-                            if last_brace != -1:
-                                block = block[:last_brace] + f" religion = {r} " + block[last_brace:]
-
+                        block = put_field(block, 'religion', identifier(new_religion))
                     content = content[:s] + block + content[e:]
 
                 else:
@@ -5687,66 +4210,34 @@ class Vic3Logic:
             with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
             self.log(f"[CONVERT] Processed {os.path.basename(target_path)}", 'success')
 
+        self.log(f"[CONVERT] Processed {len(pops_to_process)} pop groups across {len({p['state'] for p in pops_to_process})} states for {clean_tag}.", 'success')
+
+    @mod_operation
     def add_pop_to_file(self, fpath, state, region_tag, culture, religion, size):
-        self.perform_auto_backup()
-        try:
-            with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
-
-        s, e = self.get_block_range_safe(content, f"s:{state}")
-        if s is not None:
-            block = content[s:e]
-            cursor = 0
-            found = False
-            insert_idx = -1
-
-            while True:
-                m = re.search(r"region_state:([A-Za-z0-9_]+)\s*=\s*\{", block[cursor:])
-                if not m: break
-
-                tag = m.group(1)
-                rs_s, rs_e = self.find_block_content(block, cursor + m.end() - 1)
-
-                if tag == region_tag:
-                    # Found it.
-                    insert_idx = s + rs_e - 1 # Position before closing brace of region_state
-                    found = True
-                    break
-                cursor = rs_e
-
-            if found:
-                new_pop = f"\n\t\t\tcreate_pop = {{ culture = {culture} religion = {religion} size = {size} }}"
-                content = content[:insert_idx] + new_pop + content[insert_idx:]
-
-                with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(content)
+        path=Path(fpath).resolve()
+        if not path.is_relative_to(Path(self.mod_path).resolve()): raise ValueError('Population output must be inside the mod.')
+        state=self.normalize_state_key(state); tag=identifier(self.format_tag_clean(region_tag))
+        culture=identifier(culture); religion=identifier(religion) if religion else ''
+        text=path.read_text(encoding='utf-8-sig') if path.exists() else 'POPS = {\n}\n'
+        line='\n            create_pop = { culture = '+culture+(' religion = '+religion if religion else '')+f' size = {nonnegative(size)} }}\n'
+        states=script_blocks(text,'s:'+state)
+        if states:
+            b=states[0]; body=text[b['opening']+1:b['end']-1]
+            owners=script_blocks(body,'region_state:'+tag,0)
+            if owners:
+                pos=b['opening']+owners[0]['end']; text=text[:pos]+line+text[pos:]
+            else:
+                pos=b['end']-1; text=text[:pos]+'\n        region_state:'+tag+' = {'+line+'        }\n'+text[pos:]
+        else:
+            wrappers=script_blocks(text,'POPS',0)
+            if not wrappers: raise ValueError('Population file is missing its POPS wrapper.')
+            pos=wrappers[0]['end']-1
+            text=text[:pos]+'\n    s:'+state+' = {\n        region_state:'+tag+' = {'+line+'        }\n    }\n'+text[pos:]
+        atomic_text(path,text)
 
     # --- JOURNAL MANAGER LOGIC ---
     def _scan_folder_for_keys(self, rel_path, regex_pattern):
-        """Generic scanner for simple keys in a folder structure."""
-        keys = set()
-        paths = []
-        # Check mod first, then vanilla
-        if self.mod_path: paths.append(os.path.join(self.mod_path, rel_path))
-        if self.vanilla_path:
-            paths.append(os.path.join(self.vanilla_path, "game", rel_path))
-            paths.append(os.path.join(self.vanilla_path, rel_path))
-
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                    # Regex must handle potential indentation if MULTILINE is used with ^
-                    matches = re.finditer(regex_pattern, content, re.MULTILINE)
-                    for m in matches:
-                        keys.add(m.group(1))
-        return sorted(list(keys))
+        return self.definition_keys(rel_path)
 
     def scan_technologies(self):
         return self._scan_folder_for_keys("common/technology/technologies", r"^\s*([a-z0-9_]+)\s*=\s*\{")
@@ -5851,133 +4342,68 @@ class Vic3Logic:
     # --- Research ---
     ("Research - Innovation Speed (Flat)", "country_weekly_innovation_add", "Country"),
     ]
+    @mod_operation
     def save_journal_entry(self, entry_data):
+        self._require_mod()
+        key=identifier(entry_data['id'],'Journal ID')
+        activation='\n        '.join(entry_data['activation']) or 'always = yes'
+        completion='\n        '.join(entry_data['completion']) or 'always = no'
+        rewards='\n        '.join(entry_data['rewards'])
+        def update_block(body, name, value):
+            replacement = name + ' = {\n        ' + value + '\n    }'
+            matches = script_blocks(body, name, 0)
+            if not matches:
+                return body + '\n    ' + replacement + '\n'
+            first = matches[0]
+            return body[:first['start']] + replacement + body[first['end']:]
+
+        def completion_outcome(body):
+            outcomes = script_blocks(body, 'outcome', 0)
+            for item in outcomes:
+                inner = body[item['opening']+1:item['end']-1]
+                if field(inner, 'header') == 'je_standard_completion_header':
+                    return item, inner
+            return None, ('header = je_standard_completion_header\n'
+                          '        effect_header = je_standard_on_completion_header\n'
+                          f'        conclusion_desc = {key}_completed_desc\n')
+
+        text=(f'{key} = {{\n    group = je_group_objectives\n    can_revolution_inherit = yes\n'
+              f'    is_shown_when_inactive = {{\n        {activation}\n    }}\n'
+              f'    possible = {{\n        {activation}\n    }}\n'
+              '}\n')
+        script_blocks(text)
         self.perform_auto_backup()
-        mod_name = os.path.basename(self.mod_path)
+        folder=Path(self.mod_path)/'common/journal_entries'
+        path=folder/f'{Path(self.mod_path).name}_journals.txt'
+        matches=[]
+        for candidate in sorted(folder.rglob('*.txt')):
+            content=candidate.read_text(encoding='utf-8-sig')
+            for block in script_blocks(content,key,0): matches.append((candidate,content,block))
+        if len(matches)>1: raise ValueError('Duplicate journal ID; resolve it before editing.')
+        if matches:
+            path,current,block=matches[0]
+            body=current[block['opening']+1:block['end']-1]
+        else:
+            current=path.read_text(encoding='utf-8-sig') if path.exists() else ''
+            current+='\n'+text
+            block=script_blocks(current,key,0)[-1]
+            body=current[block['opening']+1:block['end']-1]
+        for item in reversed(script_blocks(body)):
+            if item['depth']==0 and item['key'] in ('complete','on_complete'):
+                body=body[:item['start']]+body[item['end']:]
+        body = update_block(body, 'possible', activation)
+        item, inner = completion_outcome(body)
+        inner = update_block(update_block(inner, 'trigger', completion), 'effect', rewards)
+        if item:
+            body = body[:item['opening']+1] + inner + body[item['end']-1:]
+        else:
+            body += '\n    outcome = {\n        ' + inner + '    }\n'
+        current=current[:block['opening']+1]+body+current[block['end']-1:]
+        atomic_text(path,current)
+        self._localize(f'{Path(self.mod_path).name}_journals', {key:entry_data['title'],key+'_reason':entry_data['desc'],key+'_completed_desc':entry_data['title']})
+        self.log(f'[SUCCESS] Saved journal {key}', 'success')
 
-        # 1. Script File
-        je_dir = os.path.join(self.mod_path, "common", "journal_entries")
-        os.makedirs(je_dir, exist_ok=True)
-        target_file = os.path.join(je_dir, f"{mod_name}_journals.txt")
-
-        # Construct content
-        je_id = entry_data['id']
-
-        # Logic to extract tag for visibility
-        visibility_block = ""
-        target_tag = None
-        for item in entry_data['activation']:
-            # Check for "this = c:TAG" or "c:TAG = THIS"
-            m = re.search(r"(?:this|THIS)\s*=\s*c:([A-Za-z0-9_]+)", item, re.IGNORECASE)
-            if not m:
-                m = re.search(r"c:([A-Za-z0-9_]+)\s*=\s*(?:this|THIS)", item, re.IGNORECASE)
-
-            if m:
-                target_tag = m.group(1)
-                break
-
-        if target_tag:
-            visibility_block = f"""
-\tis_shown_when_inactive = {{
-\t\texists = c:{target_tag}
-\t\tthis = c:{target_tag}
-\t}}
-"""
-            # Also add to history file
-            self.add_journal_entry_to_history(target_tag, je_id)
-
-        # Activation formatting
-        possible_block = ""
-        for item in entry_data['activation']:
-            possible_block += f"\t\t{item}\n"
-
-        # Completion formatting
-        complete_block = ""
-        for item in entry_data['completion']:
-            complete_block += f"\t\t{item}\n"
-
-        # Effect formatting
-        effect_block = ""
-        for item in entry_data['rewards']:
-            effect_block += f"\t\t{item}\n"
-
-        entry_content = f"""
-{je_id} = {{
-\tgroup = je_group_objectives
-\ticon = "gfx/interface/icons/event_icons/event_default.dds"
-\tcan_revolution_inherit = yes
-{visibility_block}
-\tpossible = {{
-{possible_block}\t}}
-
-\tcomplete = {{
-{complete_block}\t}}
-
-\ton_complete = {{
-{effect_block}\t}}
-}}
-"""
-
-        try:
-            current_content = ""
-            if os.path.exists(target_file):
-                try:
-                    with open(target_file, 'r', encoding='utf-8-sig') as f: current_content = f.read()
-                except:
-                    with open(target_file, 'r', encoding='utf-8') as f: current_content = f.read()
-
-            s, e = self.get_block_range_safe(current_content, je_id)
-            if s is not None:
-                # Replace existing
-                new_content = current_content[:s] + entry_content.strip() + "\n" + current_content[e:]
-            else:
-                # Append
-                if not current_content.strip():
-                    new_content = entry_content
-                else:
-                    new_content = current_content + "\n" + entry_content
-
-            with open(target_file, 'w', encoding='utf-8-sig') as f:
-                f.write(new_content)
-        except Exception as e:
-            self.log(f"[ERROR] Failed to save Journal Entry: {e}", 'error')
-            return
-
-        # 2. Localization
-        loc_dir = os.path.join(self.mod_path, "localization", "english")
-        os.makedirs(loc_dir, exist_ok=True)
-        loc_file = os.path.join(loc_dir, f"{mod_name}_journals_l_english.yml")
-
-        try:
-            loc_content = "l_english:\n"
-            if os.path.exists(loc_file):
-                try:
-                    with open(loc_file, 'r', encoding='utf-8-sig') as f: loc_content = f.read()
-                except:
-                    with open(loc_file, 'r', encoding='utf-8') as f: loc_content = f.read()
-
-            title = entry_data['title'].replace('"', '\\"')
-            desc = entry_data['desc'].replace('"', '\\"')
-
-            # Helper to update or append key
-            def update_key(content, key, value):
-                pattern = r"^\s*" + re.escape(key) + r":\d?\s*\".*\""
-                replacement = f' {key}:0 "{value}"'
-                if re.search(pattern, content, re.MULTILINE):
-                    return re.sub(pattern, replacement, content, flags=re.MULTILINE)
-                else:
-                    return content.rstrip() + "\n" + replacement + "\n"
-
-            loc_content = update_key(loc_content, je_id, title)
-            loc_content = update_key(loc_content, f"{je_id}_reason", desc)
-
-            with open(loc_file, 'w', encoding='utf-8-sig') as f:
-                f.write(loc_content)
-        except Exception as e:
-            self.log(f"[ERROR] Failed to save Localization: {e}", 'error')
-
-        self.log(f"[SUCCESS] Journal Entry {je_id} saved to {os.path.basename(target_file)}", 'success')
-
+    @mod_operation
     def save_event(self, namespace, event_id, title, desc, flavor, image, options):
         self.perform_auto_backup()
         # 1. Ensure directory
@@ -5988,13 +4414,22 @@ class Vic3Logic:
         # namespace usually determines file: namespace_events.txt
         safe_ns = namespace.strip().lower()
         evt_file = os.path.join(evt_dir, f"{safe_ns}_events.txt")
+        existing_event = None
+        for candidate in sorted(Path(evt_dir).rglob('*.txt')):
+            candidate_text = candidate.read_text(encoding='utf-8-sig')
+            matches = script_blocks(candidate_text, event_id, 0)
+            if matches:
+                if existing_event is not None: raise ValueError('Duplicate event ID; resolve it before editing.')
+                existing_event = (candidate, candidate_text, matches[0])
+        if existing_event: evt_file = str(existing_event[0])
+
 
         # 3. Format Options
         opt_str = ""
         loc_entries = []
 
         def safe_str(s):
-            return s.replace('"', '\\"')
+            return quoted(s)[1:-1]
 
         # Add Title/Desc Loc
         loc_entries.append(f' {event_id}.t:0 "{safe_str(title)}"')
@@ -6003,7 +4438,7 @@ class Vic3Logic:
 
         for idx, opt in enumerate(options):
             # Option Name ID: event_id.a, event_id.b, etc.
-            suffix = chr(97 + idx) # a, b, c...
+            suffix = chr(97 + idx) if idx < 26 else f"option_{idx+1}"
             opt_loc_id = f"{event_id}.{suffix}"
             loc_entries.append(f' {opt_loc_id}:0 "{safe_str(opt["name"])}"')
 
@@ -6031,11 +4466,26 @@ class Vic3Logic:
         {effects}
     }}"""
 
+        preserved = ''
+        if existing_event:
+            _, old_text, old = existing_event
+            old_body = old_text[old['opening']+1:old['end']-1]
+            if field(old_body, 'type', 'country_event') != 'country_event':
+                raise ValueError('The event form supports country events only.')
+            for child in reversed(script_blocks(old_body, depth=0)):
+                if child['key'] in ('option', 'event_image'):
+                    old_body = old_body[:child['start']] + old_body[child['end']:]
+            for key in ('type', 'title', 'desc', 'flavor'):
+                entry = script_fields(old_body).get(key)
+                if entry: old_body = old_body[:entry[1]] + old_body[entry[2]:]
+            preserved = old_body
+
         # 4. Construct Event Block
         # Update event_image to user specifications
         event_content = f"""
 {event_id} = {{
     type = country_event
+    {preserved}
     title = {event_id}.t
     desc = {event_id}.d
     flavor = {event_id}.f
@@ -6095,7 +4545,7 @@ class Vic3Logic:
             for entry in loc_entries:
                 key = entry.split(':')[0].strip()
                 if re.search(r"^\s*" + re.escape(key) + r":", loc_content, re.MULTILINE):
-                    loc_content = re.sub(r"^\s*" + re.escape(key) + r":.*", entry, loc_content, flags=re.MULTILINE)
+                    loc_content = re.sub(r"^\s*" + re.escape(key) + r":.*", lambda m: entry, loc_content, flags=re.MULTILINE)
                 else:
                     loc_content += entry + "\n"
 
@@ -6106,6 +4556,7 @@ class Vic3Logic:
 
         self.log(f"[SUCCESS] Event {event_id} saved to {os.path.basename(evt_file)}", 'success')
 
+    @mod_operation
     def save_modifier(self, mod_name, icon, effects, loc_name, loc_desc):
         self.perform_auto_backup()
         # Save to common/static_modifiers per request
@@ -6154,7 +4605,7 @@ class Vic3Logic:
             for entry in entries:
                 key = entry.split(':')[0].strip()
                 if re.search(r"^\s*" + re.escape(key) + r":", loc_content, re.MULTILINE):
-                    loc_content = re.sub(r"^\s*" + re.escape(key) + r":.*", entry, loc_content, flags=re.MULTILINE)
+                    loc_content = re.sub(r"^\s*" + re.escape(key) + r":.*", lambda m: entry, loc_content, flags=re.MULTILINE)
                 else:
                     loc_content += entry + "\n"
 
@@ -6280,7 +4731,7 @@ class Vic3Logic:
                         m = re.search(key + r"\s*=\s*\{", block)
                         if m:
                             bs, be = self.find_block_content(block, m.end() - 1)
-                            if bs:
+                            if bs is not None:
                                 inner = block[bs+1:be-1]
                                 return [line.strip() for line in inner.split('\n') if line.strip() and not line.strip().startswith('#')]
                         return []
@@ -6288,6 +4739,15 @@ class Vic3Logic:
                     data["activation"] = extract_lines("possible")
                     data["completion"] = extract_lines("complete")
                     data["rewards"] = extract_lines("on_complete")
+
+                    for outcome in script_blocks(block, 'outcome', 1):
+                        inner = block[outcome['opening']+1:outcome['end']-1]
+                        if field(inner, 'header') == 'je_standard_completion_header':
+                            for name, target in [('trigger', 'completion'), ('effect', 'rewards')]:
+                                parts = script_blocks(inner, name, 0)
+                                value = inner[parts[0]['opening']+1:parts[0]['end']-1] if parts else ''
+                                data[target] = [line.strip() for line in value.splitlines() if line.strip()]
+                            break
 
                     loc_name, loc_desc = self.get_je_localization(je_id)
                     data["title"] = loc_name
@@ -6297,118 +4757,36 @@ class Vic3Logic:
         return None
 
     def get_je_localization(self, je_id):
-        loc_dir = os.path.join(self.mod_path, "localization", "english")
-        name = ""
-        desc = ""
-
-        if os.path.exists(loc_dir):
-            for root, _, files in os.walk(loc_dir):
-                for file in files:
-                    if not file.endswith(".yml"): continue
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                    if not name:
-                        m = re.search(r"^\s*" + re.escape(je_id) + r":\d?\s*\"(.*)\"", content, re.MULTILINE)
-                        if m: name = m.group(1)
-
-                    if not desc:
-                        m = re.search(r"^\s*" + re.escape(je_id) + r"_reason:\d?\s*\"(.*)\"", content, re.MULTILINE)
-                        if not m:
-                            m = re.search(r"^\s*" + re.escape(je_id) + r"_desc:\d?\s*\"(.*)\"", content, re.MULTILINE)
-                        if m: desc = m.group(1)
-
-                    if name and desc: break
-                if name and desc: break
-        return name, desc
+        return self.get_loc_text(je_id),self.get_loc_text(je_id+'_reason')
 
     def get_event_data(self, event_id):
-        evt_dir = os.path.join(self.mod_path, "events")
-        if not os.path.exists(evt_dir): return None
-
-        for root, _, files in os.walk(evt_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
-
-                s, e = self.get_block_range_safe(content, event_id)
-                if s is not None:
-                    block = content[s:e]
-                    data = {"id": event_id, "options": []}
-
-                    m_ns = re.search(r"namespace\s*=\s*([A-Za-z0-9_]+)", content)
-                    data["namespace"] = m_ns.group(1) if m_ns else ""
-
-                    # Match whatever is in video = "..."
-                    m_img = re.search(r"video\s*=\s*\"([^\"]+)\"", block)
-                    data["image"] = m_img.group(1) if m_img else ""
-
-                    cursor = 0
-                    while True:
-                        m_opt = re.search(r"option\s*=\s*\{", block[cursor:])
-                        if not m_opt: break
-
-                        os_idx, oe_idx = self.find_block_content(block, cursor + m_opt.end() - 1)
-                        if os_idx:
-                            opt_block = block[os_idx+1:oe_idx-1]
-                            opt_data = {"effects": "", "ig_effects": [], "mod_effects": [], "general_effects": []}
-
-                            m_name = re.search(r"name\s*=\s*([^\s]+)", opt_block)
-                            opt_key = m_name.group(1) if m_name else ""
-                            opt_data["name"] = self.get_loc_text(opt_key)
-
-                            lines = [l.strip() for l in opt_block.split('\n') if l.strip() and not l.strip().startswith("name =")]
-                            for line in lines:
-                                m_ig = re.search(r"ig:([A-Za-z0-9_]+)\s*=\s*\{\s*add_approval\s*=\s*\{\s*value\s*=\s*(-?\d+)\s*\}\s*\}", line)
-                                if m_ig:
-                                    opt_data["ig_effects"].append({"ig": m_ig.group(1), "value": m_ig.group(2)})
-                                    continue
-
-                                m_mod = re.search(r"add_modifier\s*=\s*\{\s*name\s*=\s*([A-Za-z0-9_]+)\s*months\s*=\s*(\d+)\s*\}", line)
-                                if m_mod:
-                                    opt_data["mod_effects"].append({"name": m_mod.group(1), "duration": m_mod.group(2)})
-                                    continue
-
-                                opt_data["general_effects"].append(line)
-
-                            data["options"].append(opt_data)
-                            cursor = oe_idx
-                        else:
-                            cursor += 1
-
-                    m_title = re.search(r"title\s*=\s*([^\s]+)", block)
-                    data["title"] = self.get_loc_text(m_title.group(1)) if m_title else ""
-
-                    m_desc = re.search(r"desc\s*=\s*([^\s]+)", block)
-                    data["desc"] = self.get_loc_text(m_desc.group(1)) if m_desc else ""
-
-                    m_flav = re.search(r"flavor\s*=\s*([^\s]+)", block)
-                    data["flavor"] = self.get_loc_text(m_flav.group(1)) if m_flav else ""
-
-                    return data
+        for path in sorted((Path(self.mod_path)/'events').rglob('*.txt')):
+            text=path.read_text(encoding='utf-8-sig');matches=script_blocks(text,event_id,0)
+            if not matches:continue
+            b=matches[0];body=text[b['opening']+1:b['end']-1]
+            data=dict(id=event_id,namespace=event_id.rsplit('.',1)[0],options=[],image='')
+            for key in ('title','desc','flavor'):data[key]=self.get_loc_text(field(body,key))
+            for child in script_blocks(body,depth=0):
+                raw=body[child['opening']+1:child['end']-1]
+                if child['key']=='event_image':data['image']=field(raw,'video')
+                elif child['key']=='option':
+                    name=script_fields(raw).get('name')
+                    effects=raw[:name[1]]+raw[name[2]:] if name else raw
+                    data['options'].append(dict(name=self.get_loc_text(field(raw,'name')),effects=effects,ig_effects=[],mod_effects=[],general_effects=[]))
+            return data
         return None
 
     def get_loc_text(self, key):
-        loc_dir = os.path.join(self.mod_path, "localization", "english")
-        if not os.path.exists(loc_dir): return key
-
-        for root, _, files in os.walk(loc_dir):
-            for file in files:
-                if not file.endswith(".yml"): continue
-                try:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f: content = f.read()
-
-                m = re.search(r"^\s*" + re.escape(key) + r":\d?\s*\"(.*)\"", content, re.MULTILINE)
-                if m: return m.group(1)
-        return key
+        result=key
+        roots=([Path(self.vanilla_path)/'game'] if self.vanilla_path else [])+([Path(self.mod_path)] if self.mod_path else [])
+        for root in roots:
+            folder=root/'localization/english'
+            if not folder.exists():continue
+            for path in sorted(folder.rglob('*.yml'),key=lambda p:('replace' in p.parts,p.as_posix())):
+                text=path.read_text(encoding='utf-8-sig')
+                match=re.search(r'^\s*'+re.escape(key)+r':\d*\s*"((?:\\.|[^"\\])*)"',text,re.M)
+                if match:result=re.sub(r'\\([n"\\])',lambda m:'\n' if m[1]=='n' else m[1],match[1])
+        return result
 
     # --- BUILDING LOGIC ---
     def scan_history_building_types(self):
@@ -6525,41 +4903,31 @@ class Vic3Logic:
             cursor = e
 
     def scan_state_buildings(self, state_name):
-        """Scans buildings in a specific state."""
-        clean_state = self.format_state_clean(state_name)
-        if not clean_state: return []
+        state=self.normalize_state_key(state_name); result=[]
+        for path in self.effective_files('common/history/buildings'):
+            text=path.read_text(encoding='utf-8-sig')
+            for st in script_blocks(text,'s:'+state):
+                start=st['opening']+1; body=text[start:st['end']-1]
+                for owner in script_blocks(body,depth=0):
+                    if not owner['key'] or not owner['key'].startswith('region_state:'): continue
+                    tag=owner['key'].split(':',1)[1]; offset=start+owner['opening']+1; inner=text[offset:start+owner['end']-1]
+                    for building in script_blocks(inner,'create_building',0):
+                        a=offset+building['start']; b=offset+building['end']; raw=text[a:b]
+                        content=inner[building['opening']+1:building['end']-1]
+                        owners=[]
+                        for ob in script_blocks(content,'add_ownership',0):
+                            ownership=content[ob['opening']+1:ob['end']-1]
+                            for item in script_blocks(ownership,depth=0):
+                                fields=ownership[item['opening']+1:item['end']-1]
+                                owners.append((field(fields,'country').removeprefix('c:'),int(field(fields,'levels','0'))))
+                        level=int(field(content,'level',str(sum(v for _,v in owners) or 1)))
+                        owner_tags={t for t,v in owners if v}
+                        result.append(dict(file=str(path),is_mod=path.resolve().is_relative_to(Path(self.mod_path).resolve()),state=state,region_tag=tag,
+                            type=field(content,'building'),level=level,owner=next(iter(owner_tags)) if len(owner_tags)==1 else 'MIXED' if owner_tags else tag,
+                            indices=dict(start=a,end=b),snapshot=raw))
+        return result
 
-        buildings = []
-        processed_files = set() # Relative paths in mod
-
-        # 1. Mod
-        if self.mod_path:
-            mod_b = os.path.join(self.mod_path, "common/history/buildings")
-            if os.path.exists(mod_b):
-                for root, _, files in os.walk(mod_b):
-                    for file in files:
-                        if not file.endswith(".txt"): continue
-                        fpath = os.path.join(root, file)
-                        rel = os.path.relpath(fpath, mod_b)
-                        processed_files.add(rel)
-                        self._scan_file_for_buildings(fpath, clean_state, buildings, True)
-
-        # 2. Vanilla
-        if self.vanilla_path:
-            van_b = os.path.join(self.vanilla_path, "game/common/history/buildings")
-            if os.path.exists(van_b):
-                for root, _, files in os.walk(van_b):
-                    for file in files:
-                        if not file.endswith(".txt"): continue
-                        fpath = os.path.join(root, file)
-                        rel = os.path.relpath(fpath, van_b)
-
-                        if rel in processed_files: continue
-
-                        self._scan_file_for_buildings(fpath, clean_state, buildings, False)
-
-        return buildings
-
+    @mod_operation
     def save_state_building(self, building_entry, new_level=None, new_land_owner=None, new_building_owner=None, delete=False):
         """Updates or deletes a building entry."""
         self.perform_auto_backup()
@@ -6582,6 +4950,9 @@ class Vic3Logic:
         s = building_entry['indices']['start']
         e = building_entry['indices']['end']
 
+        if 'snapshot' not in building_entry or content[s:e] != building_entry['snapshot']:
+            raise ValueError('Building changed since loading. Reload before editing.')
+
         if delete:
             # Remove the block
             content = content[:s].rstrip() + content[e:]
@@ -6602,16 +4973,28 @@ class Vic3Logic:
             if clean_new_land != current_region:
                 moving_region = True
 
-        # 3. Update Level in block
+        # Ownership levels represent shares, not three independent building totals.
         if new_level is not None:
-            if re.search(r"level\s*=\s*\d+", block):
-                block = re.sub(r"level\s*=\s*\d+", f"level = {new_level}", block)
-            elif re.search(r"levels\s*=\s*\d+", block):
-                # Update levels inside add_ownership
-                block = re.sub(r"levels\s*=\s*\d+", f"levels = {new_level}", block, count=1)
-            else:
-                last_brace = block.rfind('}')
-                block = block[:last_brace] + f"\n\t\t\t\tlevel = {new_level}\n\t\t\t}}"
+            new_level = nonnegative(new_level, 'Building level')
+            opening = block.find('{')
+            body = block[opening+1:-1]
+            shares = []
+            for ownership in script_blocks(body, 'add_ownership', 0):
+                offset = ownership['opening']+1
+                inner = body[offset:ownership['end']-1]
+                for owner in script_blocks(inner, depth=0):
+                    start = offset+owner['opening']+1
+                    end = offset+owner['end']-1
+                    owner_body = body[start:end]
+                    shares.append((start,end,owner_body,int(field(owner_body,'levels','0'))))
+            if shares:
+                values = apportion(new_level,[item[3] for item in shares])
+                for item,value in reversed(list(zip(shares,values))):
+                    a,b,raw,_ = item
+                    body = body[:a]+put_field(raw,'levels',value)+body[b:]
+                if 'level' in script_fields(body): body = put_field(body,'level',new_level)
+            else: body = put_field(body,'level',new_level)
+            block = block[:opening+1]+body+'}'
 
         # 4. Update Ownership (Building Owner)
         if new_building_owner:
@@ -6726,6 +5109,7 @@ class Vic3Logic:
 
         with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
 
+    @mod_operation
     def add_state_building(self, state_name, land_owner_tag, building_owner_tag, building_type, level):
         """Adds a new building to a state."""
         self.perform_auto_backup()
@@ -6854,11 +5238,13 @@ class Vic3Logic:
                     data['members'] = new_members
                     self.save_power_bloc_data(leader, data)
 
+    @mod_operation
     def perform_annexation_cleanup(self, old_tag, new_tag, transferred_states):
         self.log(f"--- Performing Annexation Cleanup: {old_tag} -> {new_tag} ---", 'info')
         self.cleanup_trade_routes(old_tag)
         self.cleanup_treaties(old_tag)
-        self.update_companies(old_tag, new_tag)
+        self.clean_annexed_relations(old_tag)
+        self.log(f"[WARN] Review company-owned buildings after annexing {old_tag}. Company ownership requires an existing company in its home country.", 'warn')
         self.update_military_formations(old_tag, new_tag)
         self.cleanup_power_bloc_membership(old_tag)
         self.clean_transferred_state_references(transferred_states)
@@ -6970,357 +5356,74 @@ class Vic3Logic:
 # =============================================================================
 #  GUI IMPLEMENTATION
     def scan_military_formations(self, tag):
-        """Scans for existing military formations for a tag."""
+        tag = self.format_tag_clean(tag)
         formations = []
-        mil_dir = os.path.join(self.mod_path, "common/history/military_formations")
-        # Also check vanilla to be comprehensive? Usually we only edit mod files.
-        # If user wants to edit vanilla, they must copy it first. We can warn if only found in vanilla?
-        # For now scan mod only for editing.
-        
-        if not os.path.exists(mil_dir): return []
-
-        clean_tag = tag.replace("c:", "").strip()
-
-        for root, _, files in os.walk(mil_dir):
-            for file in files:
-                if not file.endswith(".txt"): continue
-                path = os.path.join(root, file)
-                try:
-                    with open(path, 'r', encoding='utf-8-sig') as f: content = f.read()
-                except:
-                    with open(path, 'r', encoding='utf-8') as f: content = f.read()
-
-                # Find c:TAG block
-                cursor = 0
-                while True:
-                    # Match c:TAG = { or c:TAG ?= {
-                    m_tag = re.search(r"(?:^|\s)c:" + re.escape(clean_tag) + r"\s*(\?=|:|=)?\s*\{", content[cursor:])
-                    if not m_tag: break
-                    
-                    tag_start = cursor + m_tag.start()
-                    # Find block content
-                    s_tag, e_tag = self.find_block_content(content, cursor + m_tag.end() - 1)
-                    
-                    if s_tag:
-                        tag_block = content[s_tag:e_tag]
-                        
-                        # Search for create_military_formation inside tag block
-                        inner_cursor = 0
-                        while True:
-                            m_form = re.search(r"create_military_formation\s*=\s*\{", tag_block[inner_cursor:])
-                            if not m_form: break
-                            
-                            abs_form_start_in_block = inner_cursor + m_form.start()
-                            s_form, e_form = self.find_block_content(tag_block, inner_cursor + m_form.end() - 1)
-                            
-                            if s_form:
-                                form_inner = tag_block[s_form:e_form]
-                                
-                                # Parse Data
-                                f_data = {
-                                    "file": path,
-                                    # Indices in the original file
-                                    # We need reliable way to find it again.
-                                    # Storing "scope_id" (save_scope_as) is best if it exists.
-                                    # If not, maybe index? But file changes. 
-                                    # We will store the scope ID if present, else we might rely on Name + Type + Index order?
-                                    # Let's extract save_scope_as
-                                    "id": None, 
-                                    "name": "Unknown",
-                                    "type": "army",
-                                    "units": {},
-                                    "hq": ""
-                                }
-                                
-                                # Extract Name
-                                m_name = re.search(r'name\s*=\s*"([^"]+)"', form_inner)
-                                if m_name: f_data["name"] = m_name.group(1)
-                                else:
-                                    # Unquoted?
-                                    m_name_uq = re.search(r'name\s*=\s*([^\s}]+)', form_inner)
-                                    if m_name_uq: f_data["name"] = m_name_uq.group(1)
-
-                                # Extract Type
-                                m_type = re.search(r"type\s*=\s*([A-Za-z0-9_]+)", form_inner)
-                                if m_type: f_data["type"] = m_type.group(1)
-
-                                # Extract ID
-                                m_id = re.search(r"save_scope_as\s*=\s*([A-Za-z0-9_]+)", form_inner)
-                                if m_id: f_data["id"] = m_id.group(1)
-                                else:
-                                    # Generate a temporary pseudo-ID for UI tracking? 
-                                    # Or rely on name/file.
-                                    # We'll use file+offset in memory but that's fragile.
-                                    # Let's assign an internal index for now.
-                                    f_data["id"] = f"__internal_{len(formations)}"
-
-                                # Extract HQ
-                                m_hq = re.search(r"hq_region\s*=\s*([A-Za-z0-9_:]+)", form_inner)
-                                if m_hq: f_data["hq"] = m_hq.group(1)
-
-                                # Extract Units
-                                # combat_unit = { type = ... count = ... }
-                                u_cursor = 0
-                                while True:
-                                    m_unit = re.search(r"combat_unit\s*=\s*\{", form_inner[u_cursor:])
-                                    if not m_unit: break
-                                    
-                                    us, ue = self.find_block_content(form_inner, u_cursor + m_unit.end() - 1)
-                                    if us:
-                                        u_block = form_inner[us:ue]
-                                        # Parse type and count
-                                        ut_m = re.search(r"type\s*=\s*unit_type:([A-Za-z0-9_]+)", u_block)
-                                        uc_m = re.search(r"count\s*=\s*(\d+)", u_block)
-                                        
-                                        if ut_m and uc_m:
-                                            utype = ut_m.group(1)
-                                            ucount = int(uc_m.group(1))
-                                            
-                                            # Simplify keys
-                                            # Simplify keys
-                                            if "infantry" in utype: k = "infantry"
-                                            elif "artillery" in utype: k = "artillery"
-                                            elif any(x in utype for x in ["hussars", "cavalry", "dragoons", "lancers", "cuirassiers"]): k = "cavalry"
-                                            elif "man_o_war" in utype: k = "manowar"
-                                            elif "frigate" in utype or "monitor" in utype: k = "frigate"
-                                            elif "ironclad" in utype: k = "ironclad"
-                                            else: k = utype
-                                            
-                                            f_data["units"][k] = f_data["units"].get(k, 0) + ucount
-                                        
-                                        u_cursor = ue
-                                    else:
-                                        u_cursor += 1
-
-                                formations.append(f_data)
-                                inner_cursor = e_form
-                            else:
-                                inner_cursor += 1
-                        
-                        cursor = e_tag
-                    else:
-                        cursor += 1
-                        
+        folder = Path(self.mod_path)/'common/history/military_formations'
+        if not self.mod_path or not folder.is_dir(): return []
+        for path in sorted(folder.rglob('*.txt')):
+            text = path.read_text(encoding='utf-8-sig')
+            fingerprint = hashlib.sha256(text.encode()).hexdigest()
+            for country in script_blocks(text, 'c:'+tag):
+                body_start = country['opening']+1
+                body = text[body_start:country['end']-1]
+                for form in script_blocks(body, 'create_military_formation', 0):
+                    inner = body[form['opening']+1:form['end']-1]
+                    records, units = [], {}
+                    for unit in script_blocks(inner, depth=0):
+                        if unit['key'] not in ('ship','combat_unit'): continue
+                        ubody = inner[unit['opening']+1:unit['end']-1]
+                        key = field(ubody, 'type')
+                        count = nonnegative(field(ubody, 'count','1'))
+                        records.append(dict(key=key, count=count, start=unit['start'], end=unit['end'], opening=unit['opening'], body=ubody))
+                        units[key] = units.get(key,0)+count
+                    formations.append(dict(file=str(path), tag=tag, fingerprint=fingerprint,
+                        start=body_start+form['start'], end=body_start+form['end'], opening=body_start+form['opening'],
+                        id=field(inner,'save_scope_as',f'__offset_{body_start+form["start"]}'),
+                        name=field(inner,'name','Unnamed formation'), type=field(inner,'type','army'),
+                        hq=field(inner,'hq_region'), units=units, records=records,
+                        name_token=script_fields(inner).get('name',('"Unnamed formation"',0,0))[0]))
         return formations
 
+    @mod_operation
     def delete_military_formation(self, file_path, scope_id):
-        self.perform_auto_backup()
-        if not os.path.exists(file_path): return False
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+        text = Path(file_path).read_text(encoding='utf-8-sig')
+        tags = {b['key'][2:] for b in script_blocks(text) if b['key'] and b['key'].startswith('c:')}
+        found = [f for tag in tags for f in self.scan_military_formations(tag) if Path(f['file']).resolve()==Path(file_path).resolve() and f['id']==scope_id]
+        if len(found)!=1: raise ValueError('Formation ID is missing or ambiguous. Reload the list.')
+        return self.delete_formation_ui(found[0])
 
-        # We need to find the specific formation block again.
-        # If scope_id starts with __internal_, we can't reliably find it by ID.
-        # We must rely on searching structure or re-scanning?
-        # Actually, for deletion, identifying the exact block is critical.
-        # If we have save_scope_as, it's easy.
-        # If not, we have to match Name + Type + HQ?
-        # Let's support both.
-        
-        is_internal = scope_id.startswith("__internal_")
-        # For simplicity in this implementation, if internal ID, we might fail or need robust matching.
-        # But we pass the whole object usually? No, just ID here. 
-        # Let's pass the formation object dict instead of just ID?
-        # But method signature asked for file_path and ID/indices.
-        # Let's update method signature to `delete_military_formation(self, formation_data)`
-        return False # Placeholder if called directly, use overloaded below logic
-
+    @mod_operation
     def delete_formation_ui(self, formation_data):
+        path, text = self._formation_snapshot(formation_data)
         self.perform_auto_backup()
-        file_path = formation_data['file']
-        fid = formation_data['id']
-        name = formation_data['name']
-        
-        if not os.path.exists(file_path): return False
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
+        atomic_text(path,text[:formation_data['start']]+text[formation_data['end']:])
+        if not formation_data['id'].startswith('__offset_'):
+            self.disconnect_commanders_from_formations([formation_data['id']])
+        return True
 
-        # Locate the block
-        # Strategy: Iterate blocks, check match
-        
-        found_start = -1
-        found_end = -1
-        
-        cursor = 0
-        while True:
-            # Find create_military_formation
-            m = re.search(r"create_military_formation\s*=\s*\{", content[cursor:])
-            if not m: break
-            
-            abs_start = cursor + m.start()
-            s, e = self.find_block_content(content, cursor + m.end() - 1)
-            
-            if s:
-                block = content[s:e]
-                
-                # Check match
-                # 1. ID Match
-                m_id = re.search(r"save_scope_as\s*=\s*([A-Za-z0-9_]+)", block)
-                if m_id and m_id.group(1) == fid:
-                    found_start = abs_start
-                    found_end = e
-                    break
-                
-                # 2. Name Match (fallback if internal ID)
-                if fid.startswith("__internal_"):
-                    m_name = re.search(r'name\s*=\s*"([^"]+)"', block)
-                    if m_name and m_name.group(1) == name:
-                        # Good enough?
-                        found_start = abs_start
-                        found_end = e
-                        break
-            
-                cursor = e
-            else:
-                cursor += 1
-        
-        if found_start != -1:
-            # Remove content
-            # Also clean up empty country block?
-            # Replace with newline
-            new_content = content[:found_start] + f"# Deleted Formation {name}\n" + content[found_end:]
-            with open(file_path, 'w', encoding='utf-8-sig') as f: f.write(new_content)
-            self.log(f"[MIL] Deleted formation '{name}' from {os.path.basename(file_path)}")
-            return True
-            
-        return False
-
+    @mod_operation
     def save_military_formation(self, formation_data, new_name, new_units):
-        """
-        Updates an existing formation.
-        formation_data: original dict from scan
-        new_name: str
-        new_units: dict {'infantry': 10, ...}
-        """
+        data = formation_data
+        path, text = self._formation_snapshot(data)
+        if not new_name.strip(): raise ValueError('A formation name is required.')
+        if set(new_units) != set(data['units']): raise ValueError('Reload the exact unit types before editing.')
+        counts = {key: nonnegative(value) for key,value in new_units.items()}
+        if not sum(counts.values()): raise ValueError('Use Delete Formation to remove an empty formation.')
+        inner = text[data['opening']+1:data['end']-1]
+        edits = []
+        for key, total in counts.items():
+            records = [r for r in data['records'] if r['key']==key]
+            # Preserve each state, ship modification, name and unknown field, even with mixed unit types.
+            allocated = apportion(total,[r['count'] for r in records]) if sum(r['count'] for r in records) else [total]+[0]*(len(records)-1)
+            for record, count in zip(records,allocated):
+                if count == record['count']: continue
+                replacement = '' if count == 0 else inner[record['start']:record['opening']+1]+put_field(record['body'],'count',count)+'}'
+                edits.append((record['start'],record['end'],replacement))
+        for a,b,replacement in sorted(edits,reverse=True): inner=inner[:a]+replacement+inner[b:]
+        if new_name != data['name']: inner=put_field(inner,'name',quoted(new_name))
         self.perform_auto_backup()
-        file_path = formation_data['file']
-        fid = formation_data['id']
-        
-        if not os.path.exists(file_path): return False
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
-
-        found_start = -1
-        found_end = -1
-        block_inner_start = -1
-        block_inner_end = -1
-        
-        cursor = 0
-        while True:
-            m = re.search(r"create_military_formation\s*=\s*\{", content[cursor:])
-            if not m: break
-            
-            abs_start = cursor + m.start()
-            s, e = self.find_block_content(content, cursor + m.end() - 1)
-            
-            if s:
-                block = content[s:e]
-                
-                # Match
-                match = False
-                m_id = re.search(r"save_scope_as\s*=\s*([A-Za-z0-9_]+)", block)
-                if m_id and m_id.group(1) == fid: match = True
-                elif fid.startswith("__internal_"):
-                    m_name = re.search(r'name\s*=\s*"([^"]+)"', block)
-                    if m_name and m_name.group(1) == formation_data['name']: match = True
-                
-                if match:
-                    found_start = abs_start
-                    found_end = e
-                    block_inner_start = s
-                    block_inner_end = e
-                    break
-                
-                cursor = e
-            else:
-                cursor += 1
-                
-        if found_start != -1:
-            original_block = content[block_inner_start:block_inner_end] # includes braces? No, find_block_content returns indices of { and after }
-            # Wait, find_block_content returns (start_brace_index, end_brace_index + 1)
-            # So content[s:e] is "{ ... }" including braces.
-            
-            # We want to reconstruct the inside.
-            # But we must preserve other properties (location, type, graphics, etc.)
-            
-            # 1. Update Name
-            # Regex sub name
-            new_block = original_block
-            if 'name =' in new_block:
-                new_block = re.sub(r'name\s*=\s*"[^"]+"', f'name = "{new_name}"', new_block)
-                new_block = re.sub(r'name\s*=\s*[^\s"}]+', f'name = "{new_name}"', new_block) # unquoted catch
-            else:
-                # Insert name
-                new_block = new_block.replace('{', f'{{\n\t\tname = "{new_name}"', 1)
-            
-            # 2. Update Units
-            # We need to replace all combat_unit blocks with new ones.
-            # Strategy: Strip existing combat_units, append new ones.
-            
-            # Strip existing
-            while True:
-                mu = re.search(r"combat_unit\s*=\s*\{", new_block)
-                if not mu: break
-                ms, me = self.find_block_content(new_block, mu.end()-1)
-                if ms:
-                    new_block = new_block[:mu.start()] + new_block[me:]
-                else: break
-            
-            # Find insertion point (before last brace)
-            last_brace = new_block.rfind('}')
-            
-            # Construct new units
-            # We need a location (state_region) for units.
-            # We don't know the exact state_region if not stored in data? 
-            # scan extracted HQ, but units need state_region.
-            # We should probably preserve one valid state_region from original units if possible?
-            # Or scan it during read.
-            # Let's default to Capital or search for existing state_region usage in original block?
-            
-            # Extract a reference state from original block before stripping
-            ref_state = "s:STATE_UNKNOWN"
-            m_st = re.search(r"state_region\s*=\s*([A-Za-z0-9_:]+)", original_block)
-            if m_st: ref_state = m_st.group(1)
-            
-            units_str = ""
-            for u_type, u_count in new_units.items():
-                if u_count <= 0: continue
-                
-                # Map back to game keys
-                real_type = ""
-                if u_type == "infantry": real_type = "unit_type:combat_unit_type_line_infantry"
-                elif u_type == "artillery": real_type = "unit_type:combat_unit_type_cannon_artillery"
-                elif u_type == "cavalry": real_type = "unit_type:combat_unit_type_hussars"
-                elif u_type == "manowar": real_type = "unit_type:combat_unit_type_man_o_war"
-                elif u_type == "frigate": real_type = "unit_type:combat_unit_type_frigate"
-                elif u_type == "ironclad": real_type = "unit_type:combat_unit_type_ironclad"
-                else: real_type = f"unit_type:{u_type}" if not u_type.startswith("unit_type:") else u_type
-                
-                units_str += f"""
-        combat_unit = {{
-            type = {real_type}
-            state_region = {ref_state}
-            count = {u_count}
-        }}"""
-
-            new_block = new_block[:last_brace] + units_str + "\n\t}"
-            
-            final_content = content[:found_start] + "create_military_formation =" + new_block + content[found_end:]
-            
-            with open(file_path, 'w', encoding='utf-8-sig') as f: f.write(final_content)
-            self.log(f"[MIL] Updated formation '{new_name}'")
-            return True
-            
-        return False
+        atomic_text(path,text[:data['opening']+1]+inner+text[data['end']-1:])
+        return True
 # =============================================================================
 
 class DemographicsMixer(ttk.Frame):
@@ -7567,7 +5670,6 @@ class DemographicsMixer(ttk.Frame):
 class StateObject:
     def __init__(self, state_id):
         self.id = state_id
-        self.numeric_id = None
         self.provinces = set()
         self.hubs = {
             "city": None,
@@ -7581,6 +5683,7 @@ class StateObject:
         self.impassable = []  # List of impassable provinces if any
         self.prime_land = []  # List of prime provinces if any
         self.arable_land = None
+        self.numeric_id = 0
 
 class StateManager:
     def __init__(self, vic3_logic):
@@ -7591,231 +5694,27 @@ class StateManager:
         self.load_state_regions()
 
     def load_state_regions(self):
-        self.states = {}
-        self.province_owner_map = {}
+        self.states, self.province_owner_map = {}, {}
+        for path in self.logic.effective_files('map_data/state_regions'):
+            text = path.read_text(encoding='utf-8-sig')
+            for b in script_blocks(text, depth=0):
+                if not b['key'] or not b['key'].startswith('STATE_'): continue
+                obj = StateObject(b['key'])
+                obj.file_path = str(path)
+                body = text[b['opening']+1:b['end']-1]
+                obj.numeric_id = int(field(body,'id','0'))
+                for key, attr in [('provinces','provinces'),('impassable','impassable'),('prime_land','prime_land')]:
+                    values = [t.strip('"').lower() for block in script_blocks(body,key,0) for t,_,_ in script_tokens(body[block['opening']+1:block['end']-1])]
+                    setattr(obj,attr,set(values) if key=='provinces' else values)
+                obj.hubs = {key:field(body,key) or None for key in obj.hubs}
+                obj.naval_exit_id = field(body,'naval_exit_id') or None
+                obj.arable_land = int(field(body,'arable_land','0'))
+                self.states[obj.id] = obj
+        # Rebuild after overrides so removed provinces do not remain mapped to old states.
+        for state,obj in self.states.items():
+            for province in obj.provinces: self.province_owner_map[province.lower()] = state
 
-        paths = []
-        if self.logic.vanilla_path:
-            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
-        if self.logic.mod_path:
-            paths.append(os.path.join(self.logic.mod_path, "map/data/state_regions"))
-            paths.append(os.path.join(self.logic.mod_path, "map_data/state_regions"))
-
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    filepath = os.path.join(root, file)
-                    try:
-                        with open(filepath, 'r', encoding='utf-8-sig') as f: content = f.read()
-                    except:
-                        with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
-
-                    cursor = 0
-                    while True:
-                        m = re.search(r"(STATE_[A-Za-z0-9_]+)\s*=\s*\{", content[cursor:])
-                        if not m: break
-                        state_id = m.group(1)
-                        s_idx, e_idx = self.logic.find_block_content(content, cursor + m.end() - 1)
-
-                        if s_idx:
-                            block = content[s_idx:e_idx]
-
-                            if state_id not in self.states:
-                                sobj = StateObject(state_id)
-                                self.states[state_id] = sobj
-                            else:
-                                sobj = self.states[state_id]
-
-                            sobj.file_path = filepath
-
-                            # Provinces
-                            pm = re.search(r"provinces\s*=\s*\{", block)
-                            if pm:
-                                ps, pe = self.logic.find_block_content(block, pm.end() - 1)
-                                if ps:
-                                    p_str = block[ps + 1:pe - 1]
-                                    p_str = re.sub(r"#.*", "", p_str)
-                                    provs = {p.lower() for p in p_str.replace('"', '').split()}
-                                    sobj.provinces = provs
-                                    for hex_code in provs:
-                                        self.province_owner_map[hex_code] = state_id
-
-                            # Hubs
-                            for htype in ["city", "port", "farm", "mine", "wood"]:
-                                hm = re.search(fr"{htype}\s*=\s*\"?([xX0-9A-Fa-f]+)\"?", block)
-                                if hm: sobj.hubs[htype] = hm.group(1).lower()
-
-                            # Naval Exit
-                            nm = re.search(r"naval_exit_id\s*=\s*([0-9]+)", block)
-                            if nm: sobj.naval_exit_id = nm.group(1)
-
-                            # Numeric Region ID
-                            id_match = re.search(r"(?m)^[ \t]*id\s*=\s*(\d+)", block)
-                            if id_match:
-                                sobj.numeric_id = int(id_match.group(1))
-
-                            # Impassable
-                            im = re.search(r"impassable\s*=\s*\{", block)
-                            if im:
-                                ips, ipe = self.logic.find_block_content(block, im.end() - 1)
-                                if ips:
-                                    p_str = block[ips + 1:ipe - 1]
-                                    sobj.impassable = [p.lower() for p in p_str.replace('"', '').split()]
-
-                            # Arable Land
-                            al_m = re.search(r"arable_land\s*=\s*(\d+)", block)
-                            if al_m: sobj.arable_land = int(al_m.group(1))
-
-                            cursor = e_idx
-                        else:
-                            cursor += 1
-
-    def _is_mod_state_file(self, file_path):
-        if not self.logic.mod_path or not file_path:
-            return False
-
-        mod_root = os.path.normcase(os.path.abspath(self.logic.mod_path))
-        candidate = os.path.normcase(os.path.abspath(file_path))
-        try:
-            return os.path.commonpath([candidate, mod_root]) == mod_root
-        except ValueError:
-            return False
-
-    def get_existing_state_numeric_ids(self, mod_only=False):
-        ids = []
-        for sobj in self.states.values():
-            if sobj.numeric_id is None:
-                continue
-            if mod_only and not self._is_mod_state_file(sobj.file_path):
-                continue
-            ids.append(sobj.numeric_id)
-        return ids
-
-    def get_next_state_numeric_id(self):
-        mod_ids = self.get_existing_state_numeric_ids(mod_only=True)
-        if mod_ids:
-            return max(mod_ids) + 1
-
-        all_ids = self.get_existing_state_numeric_ids(mod_only=False)
-        if all_ids:
-            return max(all_ids) + 1
-        return 1
-
-    def _normalize_state_hubs(self, state_id):
-        sobj = self.states.get(state_id)
-        if not sobj:
-            return
-
-        impassable_set = {p.lower() for p in sobj.impassable if p}
-        valid_provinces = sorted(p for p in sobj.provinces if p not in impassable_set)
-
-        for htype, h_hex in list(sobj.hubs.items()):
-            current_hub = h_hex.lower() if h_hex else None
-            if not current_hub or current_hub not in impassable_set:
-                continue
-
-            if htype == "port":
-                sobj.hubs["port"] = None
-                sobj.naval_exit_id = None
-                self.logic.log(f"[MAP] Cleared port hub for {state_id} because {current_hub} is impassable.")
-                continue
-
-            used_hubs = {
-                value.lower()
-                for key, value in sobj.hubs.items()
-                if key != htype and value and value.lower() not in impassable_set
-            }
-            candidates = [p for p in valid_provinces if p not in used_hubs]
-
-            new_hub = candidates[0] if candidates else (valid_provinces[0] if valid_provinces else None)
-            sobj.hubs[htype] = new_hub
-            if new_hub:
-                self.logic.log(f"[MAP] Moved {htype} hub for {state_id} to {new_hub} because {current_hub} is impassable.")
-            else:
-                self.logic.log(f"[MAP] Cleared {htype} hub for {state_id}; no valid non-impassable province remains.", 'warn')
-
-    def toggle_province_impassable(self, province_hex):
-        clean_hex = province_hex.lower()
-        owner_state = self.province_owner_map.get(clean_hex)
-        if not owner_state or owner_state not in self.states:
-            return None
-
-        affected_states = set()
-
-        for state_id, sobj in self.states.items():
-            filtered = [p.lower() for p in sobj.impassable if p.lower() in sobj.provinces]
-            if state_id != owner_state and clean_hex in filtered:
-                sobj.impassable = [p for p in filtered if p != clean_hex]
-                self._normalize_state_hubs(state_id)
-                affected_states.add(state_id)
-            else:
-                sobj.impassable = filtered
-
-        owner_obj = self.states[owner_state]
-        current_impassable = {p.lower() for p in owner_obj.impassable if p.lower() in owner_obj.provinces}
-        if clean_hex in current_impassable:
-            current_impassable.remove(clean_hex)
-            is_impassable = False
-        else:
-            current_impassable.add(clean_hex)
-            is_impassable = True
-
-        owner_obj.impassable = sorted(current_impassable)
-        self._normalize_state_hubs(owner_state)
-        affected_states.add(owner_state)
-
-        for state_id in affected_states:
-            self.save_state_region(state_id)
-
-        return owner_state, is_impassable, affected_states
-
-    def mark_provinces_impassable(self, province_hexes):
-        owner_targets = {}
-
-        for province_hex in province_hexes:
-            clean_hex = province_hex.lower()
-            owner_state = self.province_owner_map.get(clean_hex)
-            if not owner_state or owner_state not in self.states:
-                continue
-            owner_targets.setdefault(owner_state, set()).add(clean_hex)
-
-        if not owner_targets:
-            return 0, 0, set()
-
-        target_hexes = set()
-        for hexes in owner_targets.values():
-            target_hexes.update(hexes)
-
-        affected_states = set()
-        already_marked = 0
-        total_targets = sum(len(hexes) for hexes in owner_targets.values())
-
-        for state_id, sobj in self.states.items():
-            valid_impassable = {p.lower() for p in sobj.impassable if p.lower() in sobj.provinces}
-            original_impassable = set(valid_impassable)
-            owned_targets = owner_targets.get(state_id, set())
-
-            already_marked += len(owned_targets & valid_impassable)
-
-            if owned_targets:
-                valid_impassable.update(owned_targets)
-
-            stale_targets = target_hexes - owned_targets
-            if stale_targets:
-                valid_impassable.difference_update(stale_targets)
-
-            sobj.impassable = sorted(valid_impassable)
-            if valid_impassable != original_impassable:
-                self._normalize_state_hubs(state_id)
-                affected_states.add(state_id)
-
-        for state_id in affected_states:
-            self.save_state_region(state_id)
-
-        return total_targets - already_marked, already_marked, affected_states
-
+    @mod_operation
     def transfer_state_assets(self, new_state_id, new_owner_tag=None, source_ratios=None):
         if not source_ratios: return 0
 
@@ -8079,6 +5978,7 @@ class StateManager:
 
         return sum(p['size'] for p in new_pops_list)
 
+    @mod_operation
     def transfer_province(self, province_hex, target_state_id):
         province_hex = province_hex.lower()
         current_state_id = self.province_owner_map.get(province_hex)
@@ -8124,6 +6024,10 @@ class StateManager:
             # 2. Handle Hub Displacement (Loser)
             for htype, h_hex in loser.hubs.items():
                 if h_hex == province_hex:
+                    if htype == 'port':
+                        loser.hubs['port'] = None
+                        loser.naval_exit_id = None
+                        continue
                     used_hubs = set(v for k, v in loser.hubs.items() if v and k != htype)
                     # Filter out used hubs AND impassable terrain
                     candidates = [p for p in loser.provinces if p not in used_hubs and p not in loser.impassable]
@@ -8146,6 +6050,9 @@ class StateManager:
         # 3. Handle Hub Initialization (Winner)
         # Winner is guaranteed to exist due to check above
         winner.provinces.add(province_hex)
+        if loser and province_hex in loser.prime_land:
+            loser.prime_land.remove(province_hex)
+            if province_hex not in winner.prime_land: winner.prime_land.append(province_hex)
 
         # Update Winner Arable Land
         if winner.arable_land is None: winner.arable_land = 0
@@ -8167,12 +6074,6 @@ class StateManager:
                 winner.hubs["port"] = province_hex
                 if loser_naval_exit:
                     winner.naval_exit_id = loser_naval_exit
-        elif winner.naval_exit_id and not winner.hubs["port"]:
-            # If target has a naval exit but NO port, and we just added a province,
-            # we should assign a port to prevent validation errors (state has coast but no port hub).
-            # This assumes the naval exit implies coastal access.
-            winner.hubs["port"] = province_hex
-
         self.province_owner_map[province_hex] = target_state_id
         return True
 
@@ -8203,8 +6104,18 @@ class StateManager:
                         with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(new_content)
                         self.logic.log(f"[CLEANUP] Removed {state_id} from history/{folder}/{file}")
 
-    def create_new_state(self, state_name_key, owner_data, province_list, numeric_id=None, hub_assignments=None, naval_exit_id=None):
+    @mod_operation
+    def create_new_state(self, state_name_key, owner_data, province_list):
         state_id = self.logic.normalize_state_key(state_name_key)
+        identifier(state_id, 'State key')
+        if state_id in self.states: raise ValueError('State already exists; use the move/merge action.')
+        if not province_list: raise ValueError('Select at least one province.')
+        if any(p.lower() not in self.province_owner_map for p in province_list): raise ValueError('Every selected province must belong to a loaded state.')
+        province_list = sorted(set(p.lower() for p in province_list))
+        source_arable = set()
+        for source_id in {self.province_owner_map[p] for p in province_list}:
+            source_arable.update(self.logic.scan_state_resources(source_id)['arable'])
+
 
         if state_id not in self.states:
             sobj = StateObject(state_id)
@@ -8212,11 +6123,6 @@ class StateManager:
             sobj.file_path = os.path.join(self.logic.mod_path, "map_data", "state_regions", "99_custom_regions.txt")
             self.states[state_id] = sobj
             self.logic.log(f"Created new StateObject: {state_id}")
-        else:
-            sobj = self.states[state_id]
-
-        if numeric_id is not None and sobj.numeric_id is None:
-            sobj.numeric_id = numeric_id
 
         # Determine Strategic Region from "Loser" of first province
         strategic_region = None
@@ -8276,20 +6182,6 @@ class StateManager:
                 source_ratios[os_id] = 0.0
             self.logic.log(f"[TRANSFER] Taking {count}/{total} ({source_ratios[os_id]:.2%}) from {os_id}")
 
-        if hub_assignments is not None:
-            for hub_type in ["city", "farm", "mine", "wood"]:
-                hub_hex = hub_assignments.get(hub_type)
-                if hub_hex:
-                    sobj.hubs[hub_type] = hub_hex.lower()
-
-            port_hex = hub_assignments.get("port")
-            if port_hex:
-                sobj.hubs["port"] = port_hex.lower()
-                sobj.naval_exit_id = str(naval_exit_id) if naval_exit_id is not None else None
-            else:
-                sobj.hubs["port"] = None
-                sobj.naval_exit_id = None
-
         self._update_localization(state_id, state_name_key)
 
         # Initialize history logic (create empty block if needed)
@@ -8332,15 +6224,6 @@ class StateManager:
         # Transfer Assets (Pops & Buildings)
         total_pop = self.transfer_state_assets(state_id, primary_owner, source_ratios)
 
-        # Arable Land Adjustment: +1 for every 100k population
-        if total_pop > 0:
-            extra_arable = int(total_pop / 100000)
-            if extra_arable > 0:
-                if self.states[state_id].arable_land is None:
-                    self.states[state_id].arable_land = 0
-                self.states[state_id].arable_land += extra_arable
-                self.logic.log(f"[ARABLE] Added {extra_arable} arable land for {total_pop} population.")
-
         if strategic_region:
             self._add_to_strategic_region(state_id, strategic_region)
         else:
@@ -8360,6 +6243,10 @@ class StateManager:
                     self.logic.log(f"[INFO] State {old_s} is fully deleted. Moving military to {state_id}...")
                     self.logic.move_military_from_deleted_state(old_s, state_id)
 
+        resources = self.logic.scan_state_resources(state_id)
+        resources['arable'] = sorted(source_arable)
+        self.logic.save_state_resources(state_id, resources)
+
         # Update History (Ownership)
         # Remove from old
         for os_id, removals in history_removals.items():
@@ -8368,64 +6255,8 @@ class StateManager:
         # Add to new
         self.update_history_provinces(state_id, history_additions, [])
 
-    def _update_localization(self, state_id, name, hub_names=None, overwrite_existing=False):
-        loc_dir = os.path.join(self.logic.mod_path, "localization", "english")
-        os.makedirs(loc_dir, exist_ok=True)
-        fpath = os.path.join(loc_dir, "map_l_english.yml")
-
-        if not os.path.exists(fpath):
-            with open(fpath, 'w', encoding='utf-8-sig') as f: f.write("l_english:\n")
-
-        try:
-            with open(fpath, 'r', encoding='utf-8-sig') as f: content = f.read()
-        except:
-            with open(fpath, 'r', encoding='utf-8') as f: content = f.read()
-
-        entries = []
-        content_changed = False
-        hub_placeholder_suffixes = {
-            "city": "City",
-            "farm": "Farms",
-            "wood": "Logging Camps",
-            "mine": "Mines",
-            "port": "Port"
-        }
-
-        entries.append((state_id, name, True))
-        sobj = self.states.get(state_id)
-        if sobj:
-            for hub_type, suffix in hub_placeholder_suffixes.items():
-                if not sobj.hubs.get(hub_type):
-                    continue
-                hub_key = f"HUB_NAME_{state_id}_{hub_type}"
-                hub_name = hub_names.get(hub_type) if hub_names and hub_type in hub_names else f"{name} {suffix}"
-                entries.append((hub_key, hub_name, False))
-
-        missing_entries = []
-        for key, loc_text, include_zero in entries:
-            safe_text = self.logic.safe_str(loc_text)
-            line = f' {key}{":0" if include_zero else ":"} "{safe_text}"'
-            pattern = re.compile(r"(?m)^[ \t]*" + re.escape(key) + r":(?:0)?[ \t]*\"(?:[^\"\\]|\\.)*\"[ \t]*$")
-
-            if pattern.search(content):
-                if overwrite_existing:
-                    updated_content = pattern.sub(line, content, count=1)
-                    if updated_content != content:
-                        content = updated_content
-                        content_changed = True
-            else:
-                missing_entries.append(line)
-
-        if missing_entries:
-            entry = "\n".join(missing_entries) + "\n"
-            if content and not content.endswith(("\n", "\r")):
-                entry = "\n" + entry
-            content += entry
-            content_changed = True
-
-        if content_changed:
-            with open(fpath, 'w', encoding='utf-8-sig') as f:
-                f.write(content)
+    def _update_localization(self, state_id, name):
+        self.logic._localize('map',{state_id:name})
 
     def _init_history(self, state_id, owner_tag):
         hist_dir = os.path.join(self.logic.mod_path, "common", "history", "states")
@@ -8489,12 +6320,12 @@ class StateManager:
             m = re.search(r"(^|\s)" + re.escape(clean_reg) + r"\s*=\s*\{", target_content)
             if m:
                 s, e = self.logic.find_block_content(target_content, m.end() - 1)
-                if s:
+                if s is not None:
                     block = target_content[s:e]
                     sm = re.search(r"states\s*=\s*\{", block)
                     if sm:
                         ss, se = self.logic.find_block_content(block, sm.end() - 1)
-                        if ss:
+                        if ss is not None:
                             states_inner = block[ss + 1:se - 1]
                             if state_id not in states_inner:
                                 new_states = states_inner + f" {state_id} "
@@ -8504,6 +6335,7 @@ class StateManager:
                                 with open(target_file, 'w', encoding='utf-8-sig') as f: f.write(target_content)
                                 self.logic.log(f"Added {state_id} to {clean_reg} in {os.path.basename(target_file)}")
 
+    @mod_operation
     def update_history_provinces(self, state_id, added_data, removed_list):
         """
         Updates ownership in history files for specific provinces (adds or removes).
@@ -8552,7 +6384,7 @@ class StateManager:
                 s_start = cursor + m.start()
                 s_idx, e_idx = self.logic.find_block_content(content, cursor + m.end() - 1)
 
-                if s_idx:
+                if s_idx is not None:
                     block_content = content[s_idx:e_idx]
 
                     # Track which owners we have processed/added to in this file
@@ -8738,148 +6570,47 @@ class StateManager:
                 with open(fpath, 'w', encoding='utf-8-sig') as f: f.write(content)
                 self.logic.log(f"[HIST] Updated owned_provinces in {os.path.basename(fpath)} for {state_id}")
 
+    @mod_operation
     def save_state_region(self, state_id):
-        sobj = self.states.get(state_id)
-        if not sobj: return
-
-        # Determine target file
-        target_path = sobj.file_path
-        if not target_path or (self.logic.vanilla_path and target_path.startswith(self.logic.vanilla_path)):
-            fname = os.path.basename(sobj.file_path) if sobj.file_path else f"99_custom_regions.txt"
-            target_path = os.path.join(self.logic.mod_path, "map_data", "state_regions", fname)
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-            if sobj.file_path and os.path.exists(sobj.file_path):
-                if not os.path.exists(target_path):
-                    shutil.copy2(sobj.file_path, target_path)
-
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
-        if os.path.exists(target_path):
-            try:
-                with open(target_path, 'r', encoding='utf-8-sig') as f: content = f.read()
-            except:
-                with open(target_path, 'r', encoding='utf-8') as f: content = f.read()
-        else:
-            content = ""
-
-        if not sobj.provinces:
-            # Bug 4: Remove definition if no provinces
-            if re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content):
-                m = re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content)
-                s, e = self.logic.find_block_content(content, m.end() - 1)
-                if s:
-                    content = content[:m.start()] + content[e:]
-                    with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
-                    self.logic.log(f"[MAP] Removed empty state {state_id} from {os.path.basename(target_path)}")
-
-                    # Clean up related history entries to prevent NULL_STATE errors
-                    self.delete_state_history_entries(state_id)
+        self.logic._require_mod()
+        obj = self.states.get(state_id)
+        if not obj: raise ValueError('State is not loaded.')
+        source = Path(obj.file_path) if obj.file_path else None
+        mod = Path(self.logic.mod_path).resolve()
+        if source and source.resolve().is_relative_to(mod): target = source
+        elif source and self.logic.vanilla_path:
+            target = mod/source.resolve().relative_to((Path(self.logic.vanilla_path)/'game').resolve())
+        else: target = mod/'map_data/state_regions/99_custom_regions.txt'
+        text = target.read_text(encoding='utf-8-sig') if target.exists() else source.read_text(encoding='utf-8-sig') if source and source.exists() else ''
+        blocks = script_blocks(text,state_id,0)
+        existing = blocks[0] if blocks else None
+        if not obj.provinces:
+            if existing: atomic_text(target,text[:existing['start']]+text[existing['end']:])
+            self.delete_state_history_entries(state_id)
             return
-
-        prov_str = " ".join(f'"{p.lower()}"' for p in sobj.provinces)
-        clean_impassable = sorted({p.lower() for p in sobj.impassable if p and p.lower() in sobj.provinces})
-        sobj.impassable = clean_impassable
-        impass_str = " ".join(clean_impassable)
-
-        hubs_str = ""
-        for k, v in sobj.hubs.items():
-            if v: hubs_str += f'\n\t{k} = "{v}"'
-
-        naval_str = f"\n\tnaval_exit_id = {sobj.naval_exit_id}" if sobj.naval_exit_id else ""
-        impass_block = f'\n\timpassable = {{ {impass_str} }}' if sobj.impassable else ""
-
-        al_val = sobj.arable_land if sobj.arable_land is not None else 30
-
-        def append_block_line(block_text, line_text):
-            block_text = re.sub(r"\n?[ \t]*\}\s*$", "", block_text)
-            if not block_text.endswith("\n"):
-                block_text += "\n"
-            return block_text + f"\t{line_text}\n}}"
-
-        def cleanup_block_spacing(block_text):
-            return re.sub(r"\n(?:[ \t]*\n)+([ \t]*\})", r"\n\1", block_text)
-
-        if re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content):
-            m = re.search(r"(^|\s)" + re.escape(state_id) + r"\s*=\s*\{", content)
-            s, e = self.logic.find_block_content(content, m.end() - 1)
-            if s:
-                block = content[s:e]
-
-                if sobj.numeric_id is not None:
-                    if re.search(r"(?m)^[ \t]*id\s*=", block):
-                        block = re.sub(r"(?m)^([ \t]*)id\s*=\s*\d+", rf"\1id = {sobj.numeric_id}", block, count=1)
-                    else:
-                        block = block[:1] + f"\n\tid = {sobj.numeric_id}" + block[1:]
-
-                if re.search(r"provinces\s*=\s*\{", block):
-                    p_s, p_e = self.logic.find_block_content(block, re.search(r"provinces\s*=\s*\{", block).end() - 1)
-                    if p_s:
-                        block = block[:p_s + 1] + " " + prov_str + " " + block[p_e - 1:]
-
-                # Update arable land in file if present, else append?
-                if sobj.arable_land is not None:
-                    if re.search(r"arable_land\s*=", block):
-                        block = re.sub(r"arable_land\s*=\s*\d+", f"arable_land = {sobj.arable_land}", block)
-                    else:
-                        block = append_block_line(block, f"arable_land = {sobj.arable_land}")
-
-                for k, v in sobj.hubs.items():
-                    if v:
-                        if re.search(fr"{k}\s*=", block):
-                            block = re.sub(fr'{k}\s*=\s*"?([xX0-9A-Fa-f]+)"?', f'{k} = "{v}"', block)
-                        else:
-                            block = append_block_line(block, f'{k} = "{v}"')
-                    else:
-                        # Hub removed/None, strip from file if present
-                        if re.search(fr"{k}\s*=", block):
-                            block = re.sub(fr'{k}\s*=\s*"?([xX0-9A-Fa-f]+)"?\s*\n?', '', block)
-
-                if sobj.naval_exit_id:
-                    if re.search(r"naval_exit_id\s*=", block):
-                        block = re.sub(r"naval_exit_id\s*=\s*\d+", f"naval_exit_id = {sobj.naval_exit_id}", block, count=1)
-                    else:
-                        block = append_block_line(block, f"naval_exit_id = {sobj.naval_exit_id}")
-                else:
-                    block = re.sub(r"(?m)^[ \t]*naval_exit_id\s*=\s*\d+[ \t]*\n?", "", block, count=1)
-
-                if sobj.impassable:
-                    if re.search(r"impassable\s*=\s*\{", block):
-                        block = re.sub(
-                            r"impassable\s*=\s*\{[^{}]*\}",
-                            f"impassable = {{ {impass_str} }}",
-                            block,
-                            count=1,
-                            flags=re.S
-                        )
-                    else:
-                        block = append_block_line(block, f"impassable = {{ {impass_str} }}")
-                else:
-                    block = re.sub(r"(?ms)^[ \t]*impassable\s*=\s*\{[^{}]*\}[ \t]*\n?", "", block, count=1)
-
-                block = cleanup_block_spacing(block)
-
-                content = content[:s] + block + content[e:]
+        if not all(re.fullmatch(r'x[0-9a-fA-F]{6}',p) for p in obj.provinces): raise ValueError('Province IDs must be x followed by six hex digits.')
+        if any(v and v.lower() not in obj.provinces for v in obj.hubs.values()): raise ValueError('Every hub must belong to its state.')
+        if existing: body=text[existing['opening']+1:existing['end']-1]
         else:
-            region_numeric_id = sobj.numeric_id
-            if region_numeric_id is None:
-                region_numeric_id = self.get_next_state_numeric_id()
-                sobj.numeric_id = region_numeric_id
-                self.logic.log(f"[WARN] No numeric ID loaded for {state_id}; defaulted to {region_numeric_id}.", 'warn')
-
-            new_block = f"""{state_id} = {{
-    id = {region_numeric_id}
-    provinces = {{ {prov_str} }}
-    subsistence_building = "building_subsistence_farm"{hubs_str}{naval_str}{impass_block}
-    arable_land = {al_val}
-    arable_resources = {{ "bg_wheat_farms" "bg_livestock_ranches" }}
-    capped_resources = {{ "bg_lead_mining" 5 "bg_iron_mining" 5 "bg_logging" 10 }}
-}}
-"""
-            content += "\n" + new_block
-
-        with open(target_path, 'w', encoding='utf-8-sig') as f: f.write(content)
-        self.logic.log(f"Saved state geometry to {os.path.basename(target_path)}")
+            used = {getattr(o,'numeric_id',0) for o in self.states.values()}
+            obj.numeric_id = max(used|{0})+1
+            body=f'\n    id = {obj.numeric_id}\n    subsistence_building = "building_subsistence_farm"\n    arable_resources = {{ }}\n    capped_resources = {{ }}\n'
+        for key,values in [('provinces',obj.provinces),('impassable',obj.impassable),('prime_land',obj.prime_land)]:
+            value = key+' = { '+' '.join(quoted(v) for v in sorted(values))+' }'
+            matches=script_blocks(body,key,0)
+            if matches:
+                b=matches[0]; body=body[:b['start']]+value+body[b['end']:]
+            elif values: body += '\n    '+value+'\n'
+        body=put_field(body,'arable_land',nonnegative(obj.arable_land or 0,'Arable land'))
+        for key,value in dict(obj.hubs, naval_exit_id=obj.naval_exit_id).items():
+            old=script_fields(body).get(key)
+            if value is not None: body=put_field(body,key,str(nonnegative(value)) if key=='naval_exit_id' else quoted(value))
+            elif old: body=body[:old[1]]+body[old[2]:]
+        block=state_id+' = {'+body+'}\n'
+        result=text[:existing['start']]+block+text[existing['end']:] if existing else text+'\n'+block
+        atomic_text(target,result)
+        obj.file_path=str(target)
+        self.logic.log(f'[MAP] Saved {state_id}', 'success')
 
     def validate_state(self, state_id):
         sobj = self.states.get(state_id)
@@ -9038,17 +6769,74 @@ class StateManager:
                     self.logic.log(f"Moved military units for {tag} from {old_clean} to {new_clean}")
 
 class App(tk.Tk):
+    def config_path(self):
+        base=Path(os.environ.get('APPDATA') or os.environ.get('XDG_CONFIG_HOME') or Path.home()/'.config')
+        return base/'v3mt'/'config.json'
+
+    def report_callback_exception(self, exc_type, exc, tb):
+        self.log_message(str(exc),'error')
+        traceback.print_exception(exc_type,exc,tb)
+        messagebox.showerror('Unable to complete action',str(exc),parent=self)
+
+    def navigate(self, title, command):
+        if self.is_processing:
+            self.log_message('Wait for the current operation to finish.','warn'); return
+        command()
+        self.page_title.configure(text=title)
+        for name,button in self.nav_buttons.items(): button.configure(style='Active.Nav.TButton' if name==title else 'Nav.TButton')
+        self.canvas.yview_moveto(0)
+
+    def _scroll_page(self, event):
+        # Native list/text widgets retain their own wheel behavior.
+        if not isinstance(event.widget, tk.Misc): return
+        if event.widget.winfo_class() in ('Text','Listbox','Treeview','TCombobox','Entry','TEntry'): return
+        if str(event.widget).startswith(str(self.scrollable_frame)) or event.widget==self.canvas:
+            amount=-1 if getattr(event,'num',0)==4 else 1 if getattr(event,'num',0)==5 else (-1 if event.delta>0 else 1)
+            self.canvas.yview_scroll(amount*3,'units')
+
+    def show_validation_ui(self):
+        self.clear_content(); self.run_btn.pack_forget()
+        ttk.Label(self.content_frame,text='Check files before starting the game',font=('Segoe UI',15,'bold')).pack(anchor='w',pady=(10,8))
+        ttk.Label(self.content_frame,text='Checks structure, braces, localization, state IDs, province duplication, fleet syntax and HQ references.\nRun the game in debug mode to check effect semantics and gameplay.',style='Muted.TLabel',wraplength=780).pack(anchor='w',pady=(0,16))
+        toolbar=ttk.Frame(self.content_frame); toolbar.pack(fill='x')
+        ttk.Button(toolbar,text='Run validation',style='Accent.TButton',command=self.run_validation).pack(side='left')
+        self.validation_status=tk.StringVar(value='Ready')
+        ttk.Label(toolbar,textvariable=self.validation_status,style='Muted.TLabel').pack(side='left',padx=16)
+        self.validation_tree=ttk.Treeview(self.content_frame,columns=('level','file','message'),show='headings',height=16)
+        for key,width in [('level',70),('file',250),('message',450)]:
+            self.validation_tree.heading(key,text=key.title()); self.validation_tree.column(key,width=width)
+        self.validation_tree.pack(fill='both',expand=True,pady=16)
+        scroll=ttk.Scrollbar(self.content_frame,orient='horizontal',command=self.validation_tree.xview); scroll.pack(fill='x')
+        self.validation_tree.configure(xscrollcommand=scroll.set)
+
+    def run_validation(self):
+        if self.is_processing: return
+        self.logic._require_mod(); self.is_processing=True; self.validation_status.set('Checking files…')
+        def complete(issues,error=None):
+            self.is_processing=False
+            for row in self.validation_tree.get_children(): self.validation_tree.delete(row)
+            for issue in issues: self.validation_tree.insert('', 'end',values=(issue['level'],issue['file'],issue['message']))
+            self.validation_status.set(error or f'{sum(i["level"]=="error" for i in issues)} errors · {sum(i["level"]=="warn" for i in issues)} warnings')
+        def work():
+            try:
+                issues=self.logic.validate_mod(); self.ui_queue.put(lambda:complete(issues))
+            except Exception as exc:
+                error=str(exc); self.ui_queue.put(lambda:complete([],error))
+        threading.Thread(target=work,daemon=True).start()
+
     def __init__(self):
         super().__init__()
         self.title("Victoria 3 Modding Tool")
         self.geometry("850x700")
-        self.configure(bg="#212121")
+        self.configure(bg="#28231d")
         self.style = ttk.Style()
         self.style.theme_use('clam')
         self._configure_dark_theme()
 
-        self.logic = Vic3Logic(self.log_message)
         self.log_queue = queue.Queue()
+        self.ui_queue = queue.Queue()
+        self.logic = Vic3Logic(self.log_message)
+        self.logic.choose_transfer_technology = self.choose_building_technology
         self.is_processing = False
         self.cr_rgb = [random.randint(0,255), random.randint(0,255), random.randint(0,255)]
 
@@ -9057,199 +6845,107 @@ class App(tk.Tk):
         self.after(100, self.process_log_queue)
 
     def _configure_dark_theme(self):
-        BG_COLOR = "#212121"
-        FG_COLOR = "#ECEFF1"
-        ACCENT_COLOR = "#00ACC1"
-        SECONDARY_BG = "#323232"
-        ENTRY_BG = "#424242"
-        self.style.configure('.', background=BG_COLOR, foreground=FG_COLOR, font=('Segoe UI', 10))
-        self.style.configure('TLabel', background=BG_COLOR, foreground=FG_COLOR)
-        self.style.configure('TFrame', background=BG_COLOR)
-        self.style.configure('TLabelframe', background=BG_COLOR, foreground=FG_COLOR, bordercolor=SECONDARY_BG)
-        self.style.configure('TLabelframe.Label', background=BG_COLOR, foreground=ACCENT_COLOR, font=('Segoe UI', 10, 'bold'))
-        self.style.configure('WhiteBorder.TFrame', background=FG_COLOR)
-        self.style.configure('TButton', background=SECONDARY_BG, foreground=FG_COLOR, borderwidth=1, focuscolor=SECONDARY_BG)
-        self.style.map('TButton', background=[('active', ACCENT_COLOR), ('disabled', '#2a2a2a')], foreground=[('disabled', '#666666')])
-        self.style.configure('BlackText.TButton', background=SECONDARY_BG, foreground="black", borderwidth=1, focuscolor=SECONDARY_BG)
-        self.style.map('BlackText.TButton', background=[('active', ACCENT_COLOR), ('disabled', '#2a2a2a')], foreground=[('disabled', '#666666')])
-        self.style.configure('TEntry', fieldbackground=ENTRY_BG, foreground=FG_COLOR, bordercolor=SECONDARY_BG, lightcolor=SECONDARY_BG, darkcolor=SECONDARY_BG)
-        self.style.configure('TCheckbutton', background=BG_COLOR, foreground=FG_COLOR)
-        self.style.map('TCheckbutton', background=[('active', BG_COLOR)], indicatorcolor=[('selected', ACCENT_COLOR)])
-        self.style.configure('TRadiobutton', background=BG_COLOR, foreground=FG_COLOR)
-        self.style.map('TRadiobutton', background=[('active', BG_COLOR)], indicatorcolor=[('selected', ACCENT_COLOR)])
-
-        # Notebook Tab colors - Force black text
-        self.style.configure('TNotebook.Tab', foreground='black')
-
-        # Combobox colors - Force black text for readability
-        self.option_add('*TCombobox*Listbox.foreground', 'black')
-        self.option_add('*TCombobox*Listbox.background', 'white')
-        self.style.configure('TCombobox', foreground='black', fieldbackground='white', background='white')
-
-        # Treeview colors - Force black text
-        self.style.configure("Treeview", background="white", foreground="black", fieldbackground="white")
-        self.style.map("Treeview", background=[('selected', '#00ACC1')], foreground=[('selected', 'white')])
-
-    def get_app_base_dir(self):
-        try:
-            if getattr(sys, "frozen", False):
-                return os.path.dirname(os.path.abspath(sys.executable))
-            return os.path.dirname(os.path.abspath(__file__))
-        except Exception:
-            return os.getcwd()
-
-    def get_config_path(self):
-        return os.path.join(self.get_app_base_dir(), "config.json")
-
-    def get_config_search_paths(self):
-        paths = [self.get_config_path()]
-        legacy_path = os.path.abspath("config.json")
-        if legacy_path not in paths:
-            paths.append(legacy_path)
-        return paths
+        bg, panel, entry, line, fg, muted, accent = '#28231d','#352b21','#473a2b','#796341','#f3e7ce','#d4c2a4','#e6bc74'
+        self.configure(bg=bg)
+        self.option_add('*Font', ('Segoe UI',10))
+        self.style.configure('.',background=bg,foreground=fg,font=('Segoe UI',10),borderwidth=0)
+        for name in ('TFrame','TLabel','TCheckbutton','TRadiobutton'): self.style.configure(name,background=bg,foreground=fg)
+        self.style.configure('TLabelframe',background=bg,bordercolor=line,relief='solid',borderwidth=1)
+        self.style.configure('TLabelframe.Label',background=bg,foreground=accent,font=('Segoe UI',10,'bold'))
+        self.style.configure('TButton',background=entry,foreground=fg,padding=(12,8),borderwidth=0,focuscolor=line)
+        self.style.map('TButton',background=[('active',line),('disabled',panel)],foreground=[('disabled',muted)])
+        self.style.configure('Accent.TButton',background=accent,foreground=bg,font=('Segoe UI',10,'bold'))
+        self.style.map('Accent.TButton',background=[('active','#f2d298')],foreground=[('active',bg)])
+        self.style.configure('Nav.TButton',anchor='w',padding=(14,10),background=panel)
+        self.style.configure('Active.Nav.TButton',anchor='w',padding=(14,10),background='#574125',foreground=accent)
+        self.style.configure('Sidebar.TFrame',background=panel)
+        self.style.configure('Sidebar.TLabel',background=panel,foreground=muted)
+        self.style.configure('Title.TLabel',font=('Segoe UI',22,'bold'),foreground=fg)
+        self.style.configure('Muted.TLabel',foreground=muted)
+        self.style.configure('TEntry',fieldbackground=entry,foreground=fg,insertcolor=fg,bordercolor=line,padding=6)
+        self.style.configure('TCombobox',fieldbackground=entry,foreground=fg,background=entry,arrowcolor=accent,padding=5)
+        self.style.map('TCombobox',fieldbackground=[('readonly',entry)],foreground=[('readonly',fg)])
+        self.option_add('*TCombobox*Listbox.background',entry)
+        self.option_add('*TCombobox*Listbox.foreground',fg)
+        self.option_add('*TCombobox*Listbox.selectBackground',line)
+        self.style.configure('TNotebook',background=bg)
+        self.style.configure('TNotebook.Tab',background=panel,foreground=muted,padding=(14,9))
+        self.style.map('TNotebook.Tab',background=[('selected',entry)],foreground=[('selected',accent)])
+        self.style.configure('Treeview',background=panel,fieldbackground=panel,foreground=fg,rowheight=29)
+        self.style.configure('Treeview.Heading',background=entry,foreground=fg,padding=6)
+        self.style.map('Treeview',background=[('selected','#574125')],foreground=[('selected','#ffffff')])
+        self.style.configure('BlackText.TButton',background=entry,foreground=fg,padding=(12,8))
+        self.style.configure('WhiteBorder.TFrame',background=line)
+        for name in ('TCheckbutton','TRadiobutton'):
+            self.style.map(name,background=[('active',bg)],indicatorcolor=[('selected',accent)])
 
     def load_config(self):
+        path=self.config_path()
+        if not path.exists(): return
         try:
-            for config_path in self.get_config_search_paths():
-                if not os.path.exists(config_path):
-                    continue
-
-                with open(config_path, "r") as f:
-                    data = json.load(f)
-                    path = data.get("mod_path", "")
-                    if os.path.exists(path):
-                        self.path_var.set(path)
-                        self.logic.set_mod_path(path)
-                        self.log_message(f"Loaded Mod Path: {path}")
-
-                    v_path = data.get("vanilla_path", "")
-                    if os.path.exists(v_path):
-                        self.vanilla_path_var.set(v_path)
-                        self.logic.set_vanilla_path(v_path)
-                        self.log_message(f"Loaded Vanilla Path: {v_path}")
-                break
-        except: pass
+            data=json.loads(path.read_text(encoding='utf-8'))
+            if data.get('vanilla_path') and Path(data['vanilla_path']).exists():
+                self.logic.set_vanilla_path(data['vanilla_path']); self.vanilla_path_var.set(self.logic.vanilla_path)
+            if data.get('mod_path') and Path(data['mod_path']).exists():
+                self.logic.set_mod_path(data['mod_path']); self.path_var.set(self.logic.mod_path)
+        except (OSError,ValueError) as exc: self.log_message(f'Settings could not be loaded: {exc}','warn')
 
     def save_config(self):
-        try:
-            with open(self.get_config_path(), "w") as f:
-                json.dump({
-                    "mod_path": self.path_var.get(),
-                    "vanilla_path": self.vanilla_path_var.get()
-                }, f)
-        except: pass
+        atomic_text(self.config_path(),json.dumps(dict(mod_path=self.logic.mod_path,vanilla_path=self.logic.vanilla_path),indent=2))
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfig(self.canvas.find_withtag("all")[0], width=event.width)
 
     def _build_ui(self):
-        # Root container
-        root_frame = ttk.Frame(self)
-        root_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Canvas & Scrollbar
-        self.canvas = tk.Canvas(root_frame, highlightthickness=0, bg="#212121")
-        self.scrollbar = ttk.Scrollbar(root_frame, orient="vertical", command=self.canvas.yview)
-
-        # Scrollable Frame
-        self.scrollable_frame = ttk.Frame(self.canvas)
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-
-        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.title('V3MT 2 • Victoria 3 Modding Studio')
+        self.geometry('1280x880')
+        self.minsize(1100,800)
+        self.path_var, self.vanilla_path_var = tk.StringVar(), tk.StringVar()
+        self.autobackup_var = tk.BooleanVar(value=True)
+        sidebar=ttk.Frame(self,style='Sidebar.TFrame',padding=(16,24),width=225)
+        sidebar.pack(side='left',fill='y'); sidebar.pack_propagate(False)
+        ttk.Label(sidebar,text='V3MT',font=('Georgia',27,'bold'),foreground='#e6bc74',background='#352b21').pack(anchor='w')
+        ttk.Label(sidebar,text='VICTORIA 3 MODDING STUDIO',style='Sidebar.TLabel',font=('Segoe UI',8)).pack(anchor='w',pady=(2,25))
+        self.nav_buttons={}
+        sections=[('WORKSPACE',[('Overview',self.show_mod_manager_ui),('Validate mod',self.show_validation_ui)]),
+                  ('WORLD',[('Transfer states',self.show_transfer_ui),('Create country',self.show_create_ui),('Modify country',self.show_country_mod_ui),('Flag maker',self.show_flag_ui),('States & population',self.show_state_manager_ui),('Map & custom states',self.show_custom_states_ui)]),
+                  ('SOCIETY & POWER',[('Military',self.show_military_ui),('Diplomacy',self.show_diplomacy_ui),('Power blocs',self.show_power_bloc_ui),('Cultures & religions',self.show_rel_cul_ui),('Journals & events',self.show_journal_ui)])]
+        for group,items in sections:
+            ttk.Label(sidebar,text=group,style='Sidebar.TLabel',font=('Segoe UI',8,'bold')).pack(anchor='w',pady=(12,6))
+            for title,command in items:
+                button=ttk.Button(sidebar,text=title,style='Nav.TButton',command=lambda t=title,c=command:self.navigate(t,c))
+                button.pack(fill='x',pady=2); self.nav_buttons[title]=button
+        ttk.Label(sidebar,text=f'{APP_VERSION}  /  Victoria 3 1.15',style='Sidebar.TLabel').pack(side='bottom',anchor='w',pady=8)
+        workspace=ttk.Frame(self,padding=(24,18)); workspace.pack(side='left',fill='both',expand=True)
+        top=ttk.Frame(workspace); top.pack(fill='x')
+        self.page_title=ttk.Label(top,text='Overview',style='Title.TLabel'); self.page_title.pack(side='left')
+        ttk.Button(top,text='Backup',command=self.start_backup).pack(side='right')
+        ttk.Checkbutton(top,text='Auto-backup',variable=self.autobackup_var,command=self.toggle_auto_backup).pack(side='right',padx=12)
+        paths=ttk.Frame(workspace,padding=(0,16)); paths.pack(fill='x')
+        paths.columnconfigure(1,weight=1)
+        for row,(label,var,callback) in enumerate([('MOD',self.path_var,self.browse_folder),('GAME',self.vanilla_path_var,self.browse_vanilla_folder)]):
+            ttk.Label(paths,text=label,style='Muted.TLabel',width=7).grid(row=row,column=0,sticky='w',pady=4)
+            ttk.Entry(paths,textvariable=var,state='readonly').grid(row=row,column=1,sticky='ew',padx=8,pady=4)
+            ttk.Button(paths,text='Choose…',command=callback).grid(row=row,column=2)
+        center=ttk.Frame(workspace); center.pack(fill='both',expand=True)
+        self.canvas=tk.Canvas(center,bg='#28231d',highlightthickness=0)
+        self.scrollbar=ttk.Scrollbar(center,orient='vertical',command=self.canvas.yview)
+        self.scrollbar.pack(side='right',fill='y'); self.canvas.pack(side='left',fill='both',expand=True)
+        self.scrollable_frame=ttk.Frame(self.canvas)
+        self.canvas.create_window((0,0),window=self.scrollable_frame,anchor='nw')
+        self.scrollable_frame.bind('<Configure>',lambda e:self.canvas.configure(scrollregion=self.canvas.bbox('all')))
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-
-        self.canvas.bind('<Configure>', self._on_canvas_configure)
-
-        # Main Content
-        main_frame = ttk.Frame(self.scrollable_frame, padding=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        # 1. Mod Path with Custom Header
-        # We create a header frame separate from the LabelFrame to ensure full width expansion
-        header_frame = ttk.Frame(main_frame)
-        header_frame.pack(fill=tk.X, pady=(0, 0)) # No bottom padding so it sits on top of the box
-
-        # Title
-        ttk.Label(header_frame, text="Global Configuration", foreground="#00ACC1", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT)
-
-        # Spacer (pushes everything else to the right)
-        ttk.Frame(header_frame).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        # Buttons in the title bar - Packed to RIGHT to align them to the far right
-
-        self.autobackup_var = tk.BooleanVar(value=self.logic.auto_backup_enabled)
-        ttk.Checkbutton(header_frame, text="Auto-backup", variable=self.autobackup_var, command=self.toggle_auto_backup).pack(side=tk.RIGHT, padx=5)
-
-        ttk.Button(header_frame, text="Backup Current Mod", command=self.start_backup).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(header_frame, text="Mod Manager", command=self.show_mod_manager_ui).pack(side=tk.RIGHT, padx=5)
-
-        # Main Content Box (Fake LabelFrame to remove top gap)
-        path_border_frame = ttk.Frame(main_frame, style='WhiteBorder.TFrame')
-        path_border_frame.pack(fill=tk.X, pady=(0, 10))
-
-        path_frame = ttk.Frame(path_border_frame, padding=15)
-        path_frame.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
-
-        self.path_var = tk.StringVar()
-        ttk.Label(path_frame, text="Mod Directory:").pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Entry(path_frame, textvariable=self.path_var).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        ttk.Button(path_frame, text="Browse...", command=self.browse_folder).pack(side=tk.LEFT, padx=5)
-
-        self.vanilla_path_var = tk.StringVar() # Initialize but don't show
-
-        # 2. Navigation
-        nav_frame = ttk.Frame(main_frame)
-        nav_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        # Configure grid columns to be equal width
-        for i in range(5):
-            nav_frame.columnconfigure(i, weight=1, uniform="nav")
-
-        ttk.Button(nav_frame, text="Transfer States", command=self.show_transfer_ui).grid(row=0, column=0, padx=5, sticky="ew")
-        ttk.Button(nav_frame, text="Create Country", command=self.show_create_ui).grid(row=0, column=1, padx=5, sticky="ew")
-        ttk.Button(nav_frame, text="Military Manager", command=self.show_military_ui).grid(row=0, column=2, padx=5, sticky="ew")
-        ttk.Button(nav_frame, text="Modify Country", command=self.show_country_mod_ui).grid(row=0, column=3, padx=5, sticky="ew")
-        ttk.Button(nav_frame, text="Diplomacy", command=self.show_diplomacy_ui).grid(row=0, column=4, padx=5, sticky="ew")
-
-        nav_frame_2 = ttk.Frame(main_frame)
-        nav_frame_2.pack(fill=tk.X, pady=(0, 10))
-
-        # Configure grid columns to be equal width
-        for i in range(5):
-            nav_frame_2.columnconfigure(i, weight=1, uniform="nav")
-
-        ttk.Button(nav_frame_2, text="Powerbloc Manager", command=self.show_power_bloc_ui).grid(row=0, column=0, padx=5, sticky="ew")
-        ttk.Button(nav_frame_2, text="Religion/Culture", command=self.show_rel_cul_ui).grid(row=0, column=1, padx=5, sticky="ew")
-        ttk.Button(nav_frame_2, text="State Manager", command=self.show_state_manager_ui).grid(row=0, column=2, padx=5, sticky="ew")
-        ttk.Button(nav_frame_2, text="Journal/Event Manager", command=self.show_journal_ui).grid(row=0, column=3, padx=5, sticky="ew")
-        ttk.Button(nav_frame_2, text="Custom States", command=self.show_custom_states_ui).grid(row=0, column=4, padx=5, sticky="ew")
-
-        # 3. Dynamic Content
-        self.content_frame = ttk.Frame(main_frame)
-        self.content_frame.pack(fill=tk.BOTH, expand=False, pady=5)
-
-        # 4. Action & Log
-        self.action_frame = ttk.Frame(main_frame, padding=(0, 10))
-        self.action_frame.pack(fill=tk.X)
-        self.run_btn = ttk.Button(self.action_frame, text="Execute", command=lambda: None)
-        self.run_btn.pack(side=tk.RIGHT, padx=5)
-        
-        log_frame = ttk.LabelFrame(main_frame, text="Execution Log", padding=10)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-        self.log_area = scrolledtext.ScrolledText(log_frame, state='disabled', height=10, bg="#1e1e1e", fg="#d4d4d4", insertbackground="white", relief="flat")
-        self.log_area.pack(fill=tk.BOTH, expand=True)
-        self.log_area.tag_config('info', foreground='#d4d4d4')
-        self.log_area.tag_config('warn', foreground='#FFA726')
-        self.log_area.tag_config('error', foreground='#EF5350')
-        self.log_area.tag_config('success', foreground='#66BB6A')
-
-        self.show_transfer_ui()
+        self.canvas.bind('<Configure>',self._on_canvas_configure)
+        self.bind_all('<MouseWheel>',self._scroll_page,add='+')
+        self.bind_all('<Button-4>',self._scroll_page,add='+'); self.bind_all('<Button-5>',self._scroll_page,add='+')
+        self.content_frame=ttk.Frame(self.scrollable_frame,padding=(0,4,14,8)); self.content_frame.pack(fill='both',expand=True)
+        self.action_frame=ttk.Frame(workspace,padding=(0,10)); self.action_frame.pack(fill='x')
+        self.run_btn=ttk.Button(self.action_frame,text='Execute',style='Accent.TButton'); self.run_btn.pack(side='right')
+        log_frame=ttk.LabelFrame(workspace,text='Activity',padding=10); log_frame.pack(fill='x',pady=(6,0))
+        self.log_area=scrolledtext.ScrolledText(log_frame,state='disabled',height=5,bg='#352b21',fg='#e6d7bc',font=('Consolas',9),insertbackground='white',relief='flat',wrap='word')
+        self.log_area.pack(fill='x')
+        for level,color in [('info','#e6d7bc'),('warn','#efc079'),('error','#ff8c8c'),('success','#e6bc74')]: self.log_area.tag_config(level,foreground=color)
+        self.navigate('Overview',self.show_mod_manager_ui)
 
     def clear_content(self):
         for widget in self.content_frame.winfo_children():
@@ -9258,34 +6954,22 @@ class App(tk.Tk):
 
     # --- MODE 0: MOD MANAGER ---
     def show_mod_manager_ui(self):
-        self.clear_content()
-        self.mode = "MOD_MANAGER"
-        f = ttk.LabelFrame(self.content_frame, text="Mod Manager", padding=15)
-        f.pack(fill=tk.BOTH, expand=True)
-
-        # 1. New Mod
-        new_frame = ttk.LabelFrame(f, text="Create New Mod", padding=10)
-        new_frame.pack(fill=tk.X, pady=5)
-
-        ttk.Label(new_frame, text="Mod Name:").pack(side=tk.LEFT, padx=5)
-        self.mm_name = tk.StringVar()
-        ttk.Entry(new_frame, textvariable=self.mm_name, width=20).pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(new_frame, text="Location (Parent Folder):").pack(side=tk.LEFT, padx=5)
-        self.mm_loc = tk.StringVar()
-        # Default to standard paradox mod path if possible or current mod's parent
-        if self.path_var.get():
-             self.mm_loc.set(os.path.dirname(self.path_var.get()))
-
-        ttk.Entry(new_frame, textvariable=self.mm_loc, width=30).pack(side=tk.LEFT, padx=5)
-        ttk.Button(new_frame, text="Browse...", command=self.browse_mod_parent).pack(side=tk.LEFT, padx=5)
-
-        ttk.Button(new_frame, text="Create Mod", command=self.start_create_mod).pack(side=tk.RIGHT, padx=5)
-
-        # 2. Tools - Removed per user request (Auto-copy is integrated into Create Mod)
-        # Backup controls moved to header
-
-        self.run_btn.config(text="Ready", state='disabled')
+        self.clear_content(); self.mode='MOD_MANAGER'; self.run_btn.pack_forget()
+        ttk.Label(self.content_frame,text='Build your next alternate history.',font=('Segoe UI',16,'bold')).pack(anchor='w',pady=(14,6))
+        ttk.Label(self.content_frame,text='Choose your game installation, open a mod, or start a new project.',style='Muted.TLabel').pack(anchor='w',pady=(0,22))
+        f=ttk.LabelFrame(self.content_frame,text='New project',padding=20); f.pack(fill='x',pady=8); f.columnconfigure(1,weight=1)
+        self.mm_name=tk.StringVar(); self.mm_loc=tk.StringVar(value=str(Path(self.path_var.get()).parent) if self.path_var.get() else str(Path.home()/'Documents/Paradox Interactive/Victoria 3/mod'))
+        ttk.Label(f,text='Mod name').grid(row=0,column=0,sticky='w',pady=8)
+        ttk.Entry(f,textvariable=self.mm_name).grid(row=0,column=1,columnspan=2,sticky='ew',padx=(16,0))
+        ttk.Label(f,text='Parent folder').grid(row=1,column=0,sticky='w',pady=8)
+        ttk.Entry(f,textvariable=self.mm_loc).grid(row=1,column=1,sticky='ew',padx=16)
+        ttk.Button(f,text='Choose…',command=self.browse_mod_parent).grid(row=1,column=2)
+        ttk.Button(f,text='Create project',style='Accent.TButton',command=self.start_create_mod).grid(row=2,column=1,columnspan=2,sticky='e',pady=(15,0))
+        f=ttk.LabelFrame(self.content_frame,text='Scenario setup',padding=20); f.pack(fill='x',pady=16)
+        ttk.Label(f,text='Import current starting history before changing countries, ownership or the map.\nExisting mod files are kept. Game definitions stay available as read-only references.',style='Muted.TLabel',wraplength=700).pack(anchor='w')
+        ttk.Button(f,text='Import missing scenario files',command=self.start_copy_vanilla).pack(anchor='w',pady=(16,0))
+        ttk.Label(self.content_frame,text='Before playing',font=('Segoe UI',12,'bold')).pack(anchor='w',pady=(10,8))
+        ttk.Label(self.content_frame,text='Run Validate mod, enable the mod in a launcher playset, then start a fresh game in debug mode.\nReview error.log for script, map and database errors. Static checks cannot replace an in-game test.',style='Muted.TLabel',wraplength=760).pack(anchor='w')
 
     def browse_mod_parent(self):
         folder = filedialog.askdirectory()
@@ -9297,7 +6981,7 @@ class App(tk.Tk):
         if path and os.path.exists(path):
             return path
 
-        messagebox.showinfo("Setup", r"Select the Victoria 3 install folder (either the game root or the game subfolder), e.g: C:\Program Files (x86)\Steam\steamapps\common\Victoria 3")
+        messagebox.showinfo("Setup", r"Select the victoria 3/game folder, e.g: C:\Program Files (x86)\Steam\steamapps\common\Victoria 3\game")
         folder = filedialog.askdirectory(title="Select Vanilla Game Directory")
         if folder:
             self.vanilla_path_var.set(folder)
@@ -9308,39 +6992,20 @@ class App(tk.Tk):
         return None
 
     def start_create_mod(self):
-        name = self.mm_name.get().strip()
-        loc = self.mm_loc.get().strip()
-        if not name or not loc:
-            messagebox.showerror("Error", "Name and Location required.")
-            return
-
-        if self.logic.create_new_mod(name, loc):
-            mod_path = os.path.join(loc, name)
-            self.path_var.set(mod_path)
-            self.save_config()
-
-            # Ask if user wants to copy vanilla files now
-            if messagebox.askyesno("Setup", "Copy vanilla files to new mod now?"):
-                 v_path = self.ensure_vanilla_path()
-                 if v_path:
-                    self.log_message("Starting file copy...", 'info')
-                    threading.Thread(target=self.logic.copy_vanilla_files, args=(v_path, mod_path), daemon=True).start()
-
-            messagebox.showinfo("Success", f"Mod '{name}' created and loaded.")
+        if self.is_processing: return
+        if self.logic.create_new_mod(self.mm_name.get(),self.mm_loc.get()):
+            self.path_var.set(self.logic.mod_path); self.save_config()
+            self.log_message('Project created. Import scenario files before editing existing states and countries.','success')
 
     def start_copy_vanilla(self):
-        mod_path = self.path_var.get()
-        if not mod_path:
-             messagebox.showerror("Error", "Mod path not selected.")
-             return
-
-        v_path = self.ensure_vanilla_path()
-        if not v_path: return
-
-        if messagebox.askyesno("Confirm", "Copy vanilla files to current mod? This may overwrite existing files."):
-            self.log_message("Starting file copy...", 'info')
-            # Run in thread to avoid freezing UI
-            threading.Thread(target=self.logic.copy_vanilla_files, args=(v_path, mod_path), daemon=True).start()
+        if self.is_processing: return
+        if not self.logic.mod_path or not self.logic.vanilla_path: raise ValueError('Choose both the mod and game folders first.')
+        self.is_processing=True
+        def work():
+            try: self.logic.copy_vanilla_files(self.logic.vanilla_path,self.logic.mod_path)
+            except Exception as exc: self.log_message(str(exc),'error')
+            finally: self.ui_queue.put(lambda:setattr(self,'is_processing',False))
+        threading.Thread(target=work,daemon=True).start()
 
     def start_backup(self):
         mod_path = self.path_var.get()
@@ -9352,6 +7017,221 @@ class App(tk.Tk):
     def toggle_auto_backup(self):
         self.logic.auto_backup_enabled = self.autobackup_var.get()
         self.log_message(f"Auto-backup {'enabled' if self.logic.auto_backup_enabled else 'disabled'}.", 'info')
+
+    def choose_building_technology(self, recipient, conflicts):
+        def prompt():
+            lines = [f"{entry['state']} · {entry['type']} · {', '.join(sorted(needs))}" for entry,needs in conflicts]
+            details = '\n'.join(lines[:12])
+            if len(lines)>12:
+                details += f"\n… and {len(lines)-12} more building entries."
+            result = messagebox.askyesnocancel("Transferred buildings",
+                f"{recipient}: {len(lines)} incoming building entries require technology that could not be confirmed in starting history.\n\n"
+                + details + "\n\nYes — grant the required technologies.\nNo — delete these building entries.\nCancel — stop this transfer.",
+                parent=self, default='cancel')
+            return 'grant' if result is True else 'delete' if result is False else 'cancel'
+        if threading.current_thread() is threading.main_thread():
+            return prompt()
+        answer = queue.Queue()
+        def show():
+            try:
+                answer.put(prompt())
+            except tk.TclError:
+                answer.put('cancel')
+        self.after(0,show)
+        return answer.get()
+
+    def open_editor_picker(self, kind, on_pick):
+        if not self.logic.mod_path:
+            return messagebox.showinfo("Select from map", "Choose a mod first.")
+        if not PIL_AVAILABLE:
+            return messagebox.showerror("Select from map", "The map requires Pillow and NumPy.")
+        picker = Vic3ProvincePainter(self, self.logic, "PICK_" + kind.upper())
+        picker.on_pick = on_pick
+        picker.title("Select " + kind + " from map")
+        picker.transient(self)
+        picker.grab_set()
+
+    def map_field_button(self, parent, variable, load=None):
+        def select(owner, state):
+            variable.set(owner)
+            if load:
+                load()
+        return ttk.Button(parent, text="Select from map",
+                          command=lambda: self.open_editor_picker("country", select))
+
+    def select_map_state(self, owner, state):
+        self.sm_state_name.set(state)
+        self.load_state_manager_data()
+
+    def select_formation_location(self, owner, state):
+        self.mil_tag.set(owner)
+        self.mil_state.set(state)
+        self.load_military_formations()
+
+    def show_flag_ui(self):
+        self.clear_content()
+        self.run_btn.pack_forget()
+        if not self.logic.mod_path or not PIL_AVAILABLE:
+            ttk.Label(self.content_frame,text="Choose a mod and install Pillow and NumPy to edit flags.").pack()
+            return
+        from PIL import ImageColor
+        logic = self.logic
+        catalog = logic.flag_catalog()
+        textures = {}
+        for folder in ('patterns','colored_emblems','textured_emblems'):
+            items = textures[folder] = {}
+            roots = ([Path(logic.vanilla_path)/'game'] if logic.vanilla_path else [])+[Path(logic.mod_path)]
+            for root in roots:
+                for path in sorted((root/'gfx/coat_of_arms'/folder).rglob('*')):
+                    if path.suffix.lower() in ('.dds','.tga','.png'):
+                        items[path.name] = path
+        box = ttk.LabelFrame(self.content_frame,text='Flag maker',padding=12)
+        box.pack(fill='x')
+        bar = ttk.Frame(box)
+        bar.pack(anchor='w')
+        tag = tk.StringVar()
+        ttk.Label(bar,text='Country tag').pack(side='left')
+        ttk.Entry(bar,textvariable=tag,width=8).pack(side='left',padx=6)
+        draft = ''
+        key = ''
+        previous = None
+        status = tk.StringVar(value='Load a country to edit its base flag.')
+        def load():
+            nonlocal key, previous, draft
+            candidate = logic.format_tag_clean(tag.get())
+            identifier(candidate,'Country tag')
+            if not logic.tag_exists(candidate):
+                raise ValueError('Country tag not found.')
+            history.clear()
+            key = candidate
+            previous = catalog.get(key,(None,None))[1]
+            draft = previous if previous is not None else '\n    pattern = "pattern_solid.tga"\n    color1 = "white"\n'
+            refresh()
+        ttk.Button(bar,text='Load flag',command=load).pack(side='left')
+        self.map_field_button(bar,tag,load).pack(side='left')
+        canvas = tk.Canvas(box,width=450,height=300,bg='#382e23',highlightthickness=0)
+        canvas.pack(anchor='w',pady=8)
+        controls = ttk.Frame(box)
+        controls.pack(anchor='w')
+        def combo(row,label,values):
+            ttk.Label(controls,text=label).grid(row=row,column=0,sticky='w')
+            widget = ttk.Combobox(controls,values=sorted(values),width=39,state='readonly')
+            widget.grid(row=row,column=1,sticky='w',pady=2)
+            return widget
+        preset = combo(0,'Game flag preset',catalog)
+        pattern = combo(1,'Pattern',textures['patterns'])
+        palette = ['white','black','red','yellow','green','blue','orange','purple','brown','grey','gold']
+        colors = [combo(i+2,f'Pattern colour {i+1}',palette) for i in range(3)]
+        emblem = combo(5,'Emblem to place',textures['colored_emblems'])
+        ink = combo(6,'Emblem colour',palette)
+        ink.set('white')
+        scale = tk.DoubleVar(value=0.35)
+        ttk.Label(controls,text='Emblem size').grid(row=7,column=0,sticky='w')
+        ttk.Scale(controls,from_=0.05,to=1.0,variable=scale).grid(row=7,column=1,sticky='ew')
+        ttk.Label(box,text='Select an emblem, then click the preview to place it.').pack(anchor='w')
+        history = []
+        def rgb(value):
+            try: return ImageColor.getrgb(value.replace('_',''))
+            except ValueError: return (140,140,140)
+        def render(folder,name,size,cols):
+            path = textures[folder].get(name)
+            if not path: return None
+            with Image.open(path) as source:
+                image = source.convert('RGBA').resize(size,Image.Resampling.BILINEAR)
+            if folder == 'textured_emblems': return image
+            pixels = np.asarray(image)
+            # Pattern masks use red/yellow/white. Coloured emblems use green/blue channels.
+            g,b = (pixels[:,:,i:i+1].astype(float)/255 for i in (1,2))
+            base,second,third = (np.array(rgb(c)) for c in cols)
+            out = base*(1-g)+second*g
+            out = out*(1-b)+third*b
+            result = Image.fromarray(out.astype('uint8')).convert('RGBA')
+            result.putalpha(image.getchannel('A'))
+            return result
+        def vector(body,name,default):
+            found = script_blocks(body,name,0)
+            if found:
+                item=found[0]
+                try:
+                    x,y=map(float,body[item['opening']+1:item['end']-1].split())
+                    return x,y
+                except ValueError: pass
+            return default
+        def refresh():
+            pattern.set(field(draft,'pattern'))
+            cols=[field(draft,'color'+str(i),'white') for i in range(1,4)]
+            for widget,c in zip(colors,cols): widget.set(c)
+            image=render('patterns',pattern.get(),(450,300),cols)
+            missing=image is None
+            if missing: image=Image.new('RGBA',(450,300),rgb(cols[0]))
+            for layer in script_blocks(draft,depth=0):
+                if layer['key'] not in ('colored_emblem','textured_emblem'): continue
+                body=draft[layer['opening']+1:layer['end']-1]
+                inks=[field(body,'color'+str(i),cols[i-1]) for i in range(1,4)]
+                inks=[cols[int(c[-1])-1] if c in ('color1','color2','color3') else c for c in inks]
+                instances=[body[n['opening']+1:n['end']-1] for n in script_blocks(body,'instance',0)] or ['']
+                for inst in instances:
+                    x,y=vector(inst,'position',(0.5,0.5))
+                    w,h=vector(inst,'scale',(1,1))
+                    stamp=render(layer['key']+'s',field(body,'texture'),(max(1,min(1200,int(abs(w)*450))),max(1,min(1200,int(abs(h)*300)))),inks)
+                    if stamp is None:
+                        missing=True
+                        continue
+                    if w<0: stamp=stamp.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                    if h<0: stamp=stamp.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+                    try: stamp=stamp.rotate(-float(field(inst,'rotation','0')),expand=True)
+                    except ValueError: pass
+                    image.alpha_composite(stamp,(int(x*450-stamp.width/2),int(y*300-stamp.height/2)))
+            canvas.photo=ImageTk.PhotoImage(image)
+            canvas.delete('all')
+            canvas.create_image(0,0,image=canvas.photo,anchor='nw')
+            status.set(f'{key} · Base flag preview'+(' · Some textures unavailable' if missing else ''))
+        def update(value):
+            nonlocal draft
+            if not key: return
+            history.append((key,draft))
+            draft=value
+            refresh()
+        def apply_color(i):
+            # Replace a scalar or a structured RGB/HSV colour.
+            name='color'+str(i+1)
+            blocks=script_blocks(draft,name,0)
+            value=draft
+            if blocks:
+                item=blocks[0]
+                value=value[:item['start']]+value[item['end']:]
+            entry=script_fields(value).get(name)
+            if entry and entry[0] in ('rgb','hsv','hsv360'):
+                close=value.find('}',entry[2])
+                if close>=0: value=value[:entry[1]]+value[close+1:]
+            update(put_field(value,name,quoted(colors[i].get())))
+        preset.bind('<<ComboboxSelected>>',lambda e:update(catalog[preset.get()][1]))
+        pattern.bind('<<ComboboxSelected>>',lambda e:update(put_field(draft,'pattern',quoted(pattern.get()))))
+        for i,widget in enumerate(colors):
+            widget.bind('<<ComboboxSelected>>',lambda e,i=i:apply_color(i))
+        def place(event):
+            if emblem.get() and key:
+                size=scale.get()
+                update(draft+'\n    colored_emblem = { texture = '+quoted(emblem.get())+' color1 = '+quoted(ink.get())+
+                       f' instance = {{ position = {{ {event.x/450:.4f} {event.y/300:.4f} }} scale = {{ {size:.4f} {size:.4f} }} }} }}\n')
+        canvas.bind('<Button-1>',place)
+        def undo():
+            nonlocal draft
+            if history and history[-1][0]==key:
+                _,draft=history.pop()
+                refresh()
+        def save():
+            nonlocal previous
+            if not key or logic.format_tag_clean(tag.get())!=key: raise ValueError('Load the country first.')
+            logic.save_flag(key,previous,draft)
+            catalog.update(logic.flag_catalog())
+            previous=draft
+            status.set(f'Saved base flag for {key}.')
+        actions=ttk.Frame(box)
+        actions.pack(anchor='w',pady=6)
+        ttk.Button(actions,text='Undo edit',command=undo).pack(side='left')
+        ttk.Button(actions,text='Save flag',command=save).pack(side='left',padx=6)
+        ttk.Label(box,textvariable=status).pack(anchor='w')
 
     def open_visual_painter(self):
         if not PIL_AVAILABLE:
@@ -9386,7 +7266,7 @@ class App(tk.Tk):
 
         self.tr_states_lbl = ttk.Label(f, text="States (Space separated):")
         self.tr_states_lbl.grid(row=2, column=0, sticky=tk.NW, pady=8)
-        self.tr_states = tk.Text(f, height=4, width=50, bg="#424242", fg="#ECEFF1", insertbackground="white", relief="flat", padx=5, pady=5)
+        self.tr_states = tk.Text(f, height=4, width=50, bg="#473a2b", fg="#f3e7ce", insertbackground="white", relief="flat", padx=5, pady=5)
         self.tr_states.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=8, padx=5)
 
         # Mode Selection
@@ -9430,6 +7310,7 @@ class App(tk.Tk):
     def show_create_ui(self):
         self.clear_content()
         self.mode = "CREATE"
+        self.country_state_owners = {}
 
         all_cultures, all_religions, all_tiers, all_types = self.logic.scan_definitions_for_options()
 
@@ -9438,6 +7319,14 @@ class App(tk.Tk):
 
         f = ttk.LabelFrame(self.content_frame, text="Create Country Mode", padding=15)
         f.pack(fill=tk.X)
+
+        def open_country_map():
+            if not self.logic.mod_path:
+                return messagebox.showinfo("Country map", "Choose a mod first.")
+            painter = Vic3ProvincePainter(self, self.logic, "COUNTRY")
+            painter.transient(self)
+            painter.grab_set()
+        ttk.Button(f, text="Choose capital and states on map", command=open_country_map).grid(row=8,column=0,columnspan=4,sticky="ew",pady=8)
 
         # Row 0
         ttk.Label(f, text="New Country Tag (3 chars):").grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -9465,7 +7354,8 @@ class App(tk.Tk):
         ttk.Entry(f, textvariable=self.cr_capital, width=25).grid(row=2, column=1, sticky=tk.W, pady=5)
         
         self.cr_annex = tk.BooleanVar()
-        ttk.Checkbutton(f, text="Full Annexation", variable=self.cr_annex, command=self.toggle_annex_ui).grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=10)
+        self.cr_annex_button = ttk.Checkbutton(f, text="Full Annexation", variable=self.cr_annex, command=self.toggle_annex_ui)
+        self.cr_annex_button.grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=10)
 
         # Row 3
         ttk.Label(f, text="Tier:").grid(row=3, column=0, sticky=tk.W, pady=5)
@@ -9483,6 +7373,7 @@ class App(tk.Tk):
 
         # Row 5: Cultures
         self.all_cultures_data = all_cultures
+        self.country_religions = all_religions
         f_cult = ttk.LabelFrame(f, text="Cultures (Defaults to old tag's default culture)", padding=5)
         f_cult.grid(row=5, column=0, columnspan=2, sticky=tk.NSEW, pady=5)
 
@@ -9490,9 +7381,9 @@ class App(tk.Tk):
         self.cb_cultures = ttk.Combobox(f_cult, textvariable=self.cr_cult_search, values=all_cultures)
         self.cb_cultures.pack(fill=tk.X)
         self.cb_cultures.bind("<<ComboboxSelected>>", self.add_culture_from_combo)
-        self.cb_cultures.bind("<KeyRelease>", self.filter_culture_options)
+        culture_suggestions(self.cb_cultures, all_cultures, self.add_culture_from_combo)
 
-        self.lb_cultures = tk.Listbox(f_cult, height=4, bg="#424242", fg="#ECEFF1", selectmode=tk.SINGLE)
+        self.lb_cultures = tk.Listbox(f_cult, height=4, bg="#473a2b", fg="#f3e7ce", selectmode=tk.SINGLE)
         self.lb_cultures.pack(fill=tk.BOTH, expand=True, pady=2)
 
         ttk.Button(f_cult, text="Remove Selected", command=self.remove_culture).pack(fill=tk.X)
@@ -9502,7 +7393,7 @@ class App(tk.Tk):
         f_rel = ttk.LabelFrame(f, text="Religion (Defaults to old tag's default religion)", padding=5)
         f_rel.grid(row=5, column=2, columnspan=2, sticky=tk.NSEW, pady=5, padx=5)
 
-        canvas = tk.Canvas(f_rel, bg="#212121", height=100)
+        canvas = tk.Canvas(f_rel, bg="#28231d", height=100)
         scrollbar = ttk.Scrollbar(f_rel, orient="vertical", command=canvas.yview)
         self.scrollable_rel_frame = ttk.Frame(canvas)
 
@@ -9518,9 +7409,9 @@ class App(tk.Tk):
             ttk.Radiobutton(self.scrollable_rel_frame, text=r, variable=self.cr_religion, value=r).pack(anchor=tk.W)
 
         # Row 6
-        self.lbl_others = ttk.Label(f, text="Other States (Space sep.):\n(Must be states owned by the old tag)")
+        self.lbl_others = ttk.Label(f, text="Other States (Space sep.):\n(Choose states and owners on the map)")
         self.lbl_others.grid(row=6, column=0, sticky=tk.NW, pady=5)
-        self.cr_others = tk.Text(f, height=3, width=40, bg="#424242", fg="#ECEFF1", insertbackground="white", relief="flat")
+        self.cr_others = tk.Text(f, height=3, width=40, bg="#473a2b", fg="#f3e7ce", insertbackground="white", relief="flat")
         self.cr_others.grid(row=6, column=1, columnspan=3, sticky=tk.W, pady=5)
 
         # Row 7: Population Settings
@@ -9617,8 +7508,9 @@ class App(tk.Tk):
         self.mil_state = tk.StringVar()
         ttk.Entry(f, textvariable=self.mil_state, width=20).grid(row=1, column=1, sticky=tk.W, pady=5, padx=5)
 
-        self.mil_loc_lbl = ttk.Label(f, text="(Defaults to Capital if empty/invalid)")
+        self.mil_loc_lbl = ttk.Label(f, text="(Leave blank for capital; explicit state must be owned)")
         self.mil_loc_lbl.grid(row=1, column=2, columnspan=2, sticky=tk.W)
+        ttk.Button(f, text="Select from map", command=lambda: self.open_editor_picker("state", self.select_formation_location)).grid(row=2,column=3,sticky=tk.W)
 
         # Type Selection
         ttk.Label(f, text="Formation Type:").grid(row=2, column=0, sticky=tk.W, pady=10)
@@ -9651,9 +7543,17 @@ class App(tk.Tk):
         # Reuse mil_tag or separate? Let's reuse for convenience
         ttk.Entry(mc, textvariable=self.mil_tag, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(mc, text="Load Formations", command=self.load_military_formations).pack(side=tk.LEFT, padx=5)
+        self.map_field_button(mc, self.mil_tag, self.load_military_formations).pack(side=tk.LEFT,padx=5)
+
+        def rename_transferred():
+            tag = self.mil_tag.get().strip()
+            if tag:
+                self.logic.rename_transfer_placeholders(tag)
+                self.load_military_formations()
+        ttk.Button(mc, text="Rename transferred formations", command=rename_transferred).pack(side=tk.LEFT, padx=5)
 
         # List
-        self.mil_listbox = tk.Listbox(m, height=8, bg="#424242", fg="#ECEFF1")
+        self.mil_listbox = tk.Listbox(m, height=8, bg="#473a2b", fg="#f3e7ce")
         self.mil_listbox.pack(fill=tk.BOTH, expand=True, pady=5)
         self.mil_listbox.bind('<<ListboxSelect>>', self.on_formation_select)
 
@@ -9688,72 +7588,33 @@ class App(tk.Tk):
         self.mil_edit_u2 = tk.IntVar()
         self.mil_edit_u3 = tk.IntVar()
     def update_mil_inputs(self):
-        # Clear existing widgets in unit frame
-        for widget in self.mil_unit_frame.winfo_children():
-            widget.destroy()
-
-        m_type = self.mil_type.get()
-        
-        if m_type == "army":
-            self.mil_name.set("First Army" if "Fleet" in self.mil_name.get() else self.mil_name.get())
-            self.mil_loc_lbl.config(text="(Defaults to Capital if empty/invalid)", foreground="#ECEFF1")
-
-            ttk.Label(self.mil_unit_frame, text="Infantry:").grid(row=0, column=0, padx=5)
-            self.mil_u1 = tk.IntVar(value=10)
-            ttk.Entry(self.mil_unit_frame, textvariable=self.mil_u1, width=5).grid(row=0, column=1, padx=5)
-
-            ttk.Label(self.mil_unit_frame, text="Artillery:").grid(row=0, column=2, padx=5)
-            self.mil_u2 = tk.IntVar(value=0)
-            ttk.Entry(self.mil_unit_frame, textvariable=self.mil_u2, width=5).grid(row=0, column=3, padx=5)
-
-            ttk.Label(self.mil_unit_frame, text="Cavalry:").grid(row=0, column=4, padx=5)
-            self.mil_u3 = tk.IntVar(value=0)
-            ttk.Entry(self.mil_unit_frame, textvariable=self.mil_u3, width=5).grid(row=0, column=5, padx=5)
-
-        else:
-            self.mil_name.set("First Fleet" if "Army" in self.mil_name.get() else self.mil_name.get())
-            self.mil_loc_lbl.config(text="(Warning: Must be Coastal or Game Crash!)", foreground="#EF5350")
-
-            ttk.Label(self.mil_unit_frame, text="Man-of-War:").grid(row=0, column=0, padx=5)
-            self.mil_u1 = tk.IntVar(value=5)
-            ttk.Entry(self.mil_unit_frame, textvariable=self.mil_u1, width=5).grid(row=0, column=1, padx=5)
-
-            ttk.Label(self.mil_unit_frame, text="Frigate:").grid(row=0, column=2, padx=5)
-            self.mil_u2 = tk.IntVar(value=10)
-            ttk.Entry(self.mil_unit_frame, textvariable=self.mil_u2, width=5).grid(row=0, column=3, padx=5)
-
-            ttk.Label(self.mil_unit_frame, text="Ironclad:").grid(row=0, column=4, padx=5)
-            self.mil_u3 = tk.IntVar(value=0)
-            ttk.Entry(self.mil_unit_frame, textvariable=self.mil_u3, width=5).grid(row=0, column=5, padx=5)
+        for widget in self.mil_unit_frame.winfo_children(): widget.destroy()
+        navy=self.mil_type.get()=='navy'
+        self.mil_name.set('First Fleet' if navy else 'First Army')
+        self.mil_loc_lbl.configure(text='Leave blank for the owned capital; HQ comes from current regions.',foreground='#d4c2a4')
+        keys=self.logic.definition_keys('common/ship_types' if navy else 'common/combat_unit_types')
+        if not navy: keys=[k for k in keys if not any(x in k for x in ('man_o_war','frigate','ironclad','monitor','dreadnought','submarine','carrier','battleship'))]
+        defaults=['ship_type_ship_of_the_line','ship_type_frigate','ship_type_ironclad'] if navy else ['combat_unit_type_line_infantry','combat_unit_type_cannon_artillery','combat_unit_type_hussars']
+        self.mil_create_rows=[]
+        if not keys:
+            ttk.Label(self.mil_unit_frame,text='Choose current game files to load available unit types.',foreground='#efc079').grid(row=0,column=0,columnspan=3,sticky='w')
+        for row in range(3):
+            key=tk.StringVar(value=defaults[row] if defaults[row] in keys else (keys[0] if keys else ''))
+            count=tk.StringVar(value='5' if row==0 else '0')
+            self.mil_create_rows.append((key,count))
+            ttk.Label(self.mil_unit_frame,text='Ship type' if navy else 'Unit type').grid(row=row+1,column=0,sticky='w',pady=3)
+            ttk.Combobox(self.mil_unit_frame,textvariable=key,values=keys,state='readonly',width=40).grid(row=row+1,column=1,padx=10,sticky='ew')
+            ttk.Entry(self.mil_unit_frame,textvariable=count,width=8).grid(row=row+1,column=2)
+        self.mil_unit_frame.columnconfigure(1,weight=1)
 
     def start_create_military(self):
         if self.is_processing: return
-        mod_path = self.path_var.get()
-        if not mod_path: return messagebox.showerror("Error", "Select mod path first.")
-
-        tag = self.logic.format_tag_clean(self.mil_tag.get())
-        name = self.mil_name.get().strip()
-        state = self.logic.format_state_clean(self.mil_state.get())
-        m_type = self.mil_type.get()
-
-        if not tag: return messagebox.showerror("Error", "Tag is required.")
-        if not name: name = "Army" if m_type == "army" else "Fleet"
-
-        try:
-            u1 = int(self.mil_u1.get())
-            u2 = int(self.mil_u2.get())
-            u3 = int(self.mil_u3.get())
-        except:
-             return messagebox.showerror("Error", "Unit counts must be integers.")
-
-        self.is_processing = True
-        self.run_btn.config(state='disabled')
-        self.log_area.config(state='normal'); self.log_area.delete('1.0', tk.END); self.log_area.config(state='disabled')
-
-        if m_type == "army":
-             threading.Thread(target=self.run_army_logic, args=(tag, name, state, u1, u2, u3), daemon=True).start()
-        else:
-             threading.Thread(target=self.run_navy_logic, args=(tag, name, state, u1, u2, u3), daemon=True).start()
+        units={}
+        for key,count in self.mil_create_rows:
+            value=nonnegative(count.get())
+            if value: units[key.get()]=units.get(key.get(),0)+value
+        self.logic._write_formation(self.mil_tag.get(),self.mil_name.get(),self.mil_state.get(),units,fleet=self.mil_type.get()=='navy')
+        self.load_military_formations()
     def load_military_formations(self):
         tag = self.logic.format_tag_clean(self.mil_tag.get())
         if not tag: return messagebox.showerror("Error", "Tag required.")
@@ -9770,76 +7631,26 @@ class App(tk.Tk):
         self.log_message(f"Loaded {len(self.current_formations)} formations for {tag}", 'success')
 
     def on_formation_select(self, event=None):
-        sel = self.mil_listbox.curselection()
-        if not sel: return
-        
-        idx = sel[0]
-        if idx >= len(self.current_formations): return
-        
-        self.selected_formation_index = idx
-        data = self.current_formations[idx]
-        
+        selection=self.mil_listbox.curselection()
+        if not selection: return
+        self.selected_formation_index=selection[0]
+        data=self.current_formations[selection[0]]
         self.mil_edit_name.set(data['name'])
-        
-        # Build Unit Edit UI dynamically based on type
-        for w in self.mil_edit_units_frame.winfo_children(): w.destroy()
-        
-        # We use standard 3 columns for common types
-        # Map units to vars
-        units = data['units']
-        
-        if data['type'] == 'army':
-            ttk.Label(self.mil_edit_units_frame, text="Infantry:").grid(row=0, column=0)
-            self.mil_edit_u1.set(units.get('infantry', 0))
-            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u1, width=5).grid(row=0, column=1, padx=5)
-            
-            ttk.Label(self.mil_edit_units_frame, text="Artillery:").grid(row=0, column=2)
-            self.mil_edit_u2.set(units.get('artillery', 0))
-            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u2, width=5).grid(row=0, column=3, padx=5)
-            
-            ttk.Label(self.mil_edit_units_frame, text="Cavalry:").grid(row=0, column=4)
-            self.mil_edit_u3.set(units.get('cavalry', 0))
-            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u3, width=5).grid(row=0, column=5, padx=5)
-            
-        else: # Navy
-            ttk.Label(self.mil_edit_units_frame, text="Man-of-War:").grid(row=0, column=0)
-            self.mil_edit_u1.set(units.get('manowar', 0))
-            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u1, width=5).grid(row=0, column=1, padx=5)
-            
-            ttk.Label(self.mil_edit_units_frame, text="Frigate:").grid(row=0, column=2)
-            self.mil_edit_u2.set(units.get('frigate', 0))
-            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u2, width=5).grid(row=0, column=3, padx=5)
-            
-            ttk.Label(self.mil_edit_units_frame, text="Ironclad:").grid(row=0, column=4)
-            self.mil_edit_u3.set(units.get('ironclad', 0))
-            ttk.Entry(self.mil_edit_units_frame, textvariable=self.mil_edit_u3, width=5).grid(row=0, column=5, padx=5)
+        for widget in self.mil_edit_units_frame.winfo_children(): widget.destroy()
+        self.mil_edit_vars={}
+        for row,(key,value) in enumerate(data['units'].items()):
+            var=tk.StringVar(value=str(value)); self.mil_edit_vars[key]=var
+            ttk.Label(self.mil_edit_units_frame,text=key.split(':')[-1]).grid(row=row,column=0,sticky='w',pady=3)
+            ttk.Entry(self.mil_edit_units_frame,textvariable=var,width=10).grid(row=row,column=1,padx=12)
 
     def execute_update_formation(self):
-        if self.selected_formation_index < 0: return
-        
-        data = self.current_formations[self.selected_formation_index]
-        new_name = self.mil_edit_name.get().strip()
-        if not new_name: return messagebox.showerror("Error", "Name required.")
-        
-        # Gather units
-        new_units = {}
-        try:
-            if data['type'] == 'army':
-                new_units['infantry'] = int(self.mil_edit_u1.get())
-                new_units['artillery'] = int(self.mil_edit_u2.get())
-                new_units['cavalry'] = int(self.mil_edit_u3.get())
-            else:
-                new_units['manowar'] = int(self.mil_edit_u1.get())
-                new_units['frigate'] = int(self.mil_edit_u2.get())
-                new_units['ironclad'] = int(self.mil_edit_u3.get())
-        except: return messagebox.showerror("Error", "Units must be integers.")
-        
-        success = self.logic.save_military_formation(data, new_name, new_units)
-        if success:
-            messagebox.showinfo("Success", "Formation updated.")
-            self.load_military_formations() # Refresh
-        else:
-            messagebox.showerror("Error", "Could not find or update formation.")
+        if self.is_processing or self.selected_formation_index<0: return
+        data=self.current_formations[self.selected_formation_index]
+        new_units={key:nonnegative(var.get()) for key,var in self.mil_edit_vars.items()}
+        self.logic.save_military_formation(data,self.mil_edit_name.get(),new_units)
+        self.load_military_formations()
+        self.selected_formation_index=-1
+        self.log_message('Formation saved; unit types and extra fields preserved.','success')
 
     def execute_delete_formation(self):
         if self.selected_formation_index < 0: return
@@ -9876,6 +7687,7 @@ class App(tk.Tk):
         self.mc_tag = tk.StringVar()
         ttk.Entry(top_frame, textvariable=self.mc_tag, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="Load Data", command=self.load_country_mod_data).pack(side=tk.LEFT, padx=5)
+        self.map_field_button(top_frame, self.mc_tag, self.load_country_mod_data).pack(side=tk.LEFT, padx=5)
 
         # Identity
         id_frame = ttk.LabelFrame(f, text="Country Identity", padding=5)
@@ -9904,7 +7716,7 @@ class App(tk.Tk):
         pc_frame = ttk.Frame(cr_frame)
         pc_frame.grid(row=0, column=1, sticky=tk.W, padx=5)
 
-        self.lb_mc_cultures = tk.Listbox(pc_frame, height=4, width=30, bg="#424242", fg="#ECEFF1")
+        self.lb_mc_cultures = tk.Listbox(pc_frame, height=4, width=30, bg="#473a2b", fg="#f3e7ce")
         self.lb_mc_cultures.pack(side=tk.LEFT, fill=tk.BOTH)
 
         pc_ctrl = ttk.Frame(pc_frame)
@@ -10141,6 +7953,7 @@ class App(tk.Tk):
 
         self.log_message(f"Copied pop settings from {src_tag}", 'info')
 
+    @mod_operation
     def save_country_mod_changes(self):
         tag = self.logic.format_tag_clean(self.mc_tag.get())
         if not tag: return
@@ -10199,6 +8012,7 @@ class App(tk.Tk):
         self.dip_tag = tk.StringVar()
         ttk.Entry(top_frame, textvariable=self.dip_tag, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="Load Data", command=self.load_diplomacy_ui_data).pack(side=tk.LEFT, padx=5)
+        self.map_field_button(top_frame, self.dip_tag, self.load_diplomacy_ui_data).pack(side=tk.LEFT,padx=5)
 
         # Lists
         list_frame = ttk.Frame(f)
@@ -10207,14 +8021,14 @@ class App(tk.Tk):
         # Subjects
         sf = ttk.LabelFrame(list_frame, text="Subject Relationships", padding=5)
         sf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
-        self.lb_subjects = tk.Listbox(sf, height=8, bg="#424242", fg="#ECEFF1")
+        self.lb_subjects = tk.Listbox(sf, height=8, bg="#473a2b", fg="#f3e7ce")
         self.lb_subjects.pack(fill=tk.BOTH, expand=True)
         ttk.Button(sf, text="Remove Selected", command=lambda: self.remove_dip_item("subject")).pack(fill=tk.X)
 
         # Hostiles
         hf = ttk.LabelFrame(list_frame, text="Hostile / Truces", padding=5)
         hf.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5,0))
-        self.lb_hostiles = tk.Listbox(hf, height=8, bg="#424242", fg="#ECEFF1")
+        self.lb_hostiles = tk.Listbox(hf, height=8, bg="#473a2b", fg="#f3e7ce")
         self.lb_hostiles.pack(fill=tk.BOTH, expand=True)
         ttk.Button(hf, text="Remove Selected", command=lambda: self.remove_dip_item("hostile")).pack(fill=tk.X)
 
@@ -10237,6 +8051,7 @@ class App(tk.Tk):
         self.cb_dip_type.current(0)
 
         ttk.Button(add_frame, text="Create", command=self.create_diplomacy_pact).grid(row=0, column=5, padx=5)
+        self.map_field_button(add_frame, self.dip_target).grid(row=1,column=1,sticky=tk.W)
 
         # Relations Value
         rel_frame = ttk.LabelFrame(f, text="Set Relations", padding=5)
@@ -10251,6 +8066,7 @@ class App(tk.Tk):
         ttk.Entry(rel_frame, textvariable=self.dip_rel_val, width=5).grid(row=0, column=3, padx=5)
 
         ttk.Button(rel_frame, text="Set Relation", command=self.set_relation_val).grid(row=0, column=4, padx=5)
+        self.map_field_button(rel_frame, self.dip_rel_target).grid(row=1,column=1,sticky=tk.W)
 
         self.run_btn.config(text="Refresh Data", command=self.load_diplomacy_ui_data, state='normal')
 
@@ -10351,6 +8167,7 @@ class App(tk.Tk):
         e_tag = ttk.Entry(sel_frame, textvariable=self.pb_tag, width=10)
         e_tag.pack(side=tk.LEFT, padx=5)
         e_tag.bind("<FocusOut>", lambda e: self.load_pb_data_by_tag())
+        self.map_field_button(sel_frame, self.pb_tag, self.load_pb_data_by_tag).pack(side=tk.LEFT,padx=5)
 
         ttk.Label(sel_frame, text="OR Select Bloc:").pack(side=tk.LEFT, padx=(15, 5))
         self.pb_select_var = tk.StringVar()
@@ -10440,6 +8257,7 @@ class App(tk.Tk):
         self.pb_member_add_var = tk.StringVar()
         ttk.Entry(m_ctrl, textvariable=self.pb_member_add_var, width=8).pack(side=tk.LEFT, padx=5)
         ttk.Button(m_ctrl, text="+", width=3, command=self.add_pb_member).pack(side=tk.LEFT)
+        self.map_field_button(m_ctrl, self.pb_member_add_var).pack(side=tk.LEFT,padx=5)
         ttk.Button(m_ctrl, text="Remove", width=7, command=self.remove_pb_member).pack(side=tk.RIGHT)
 
         # 4. Actions
@@ -10792,32 +8610,30 @@ class App(tk.Tk):
 
     # --- SHARED FUNCTIONS ---
     def browse_folder(self):
-        folder = filedialog.askdirectory()
+        if self.is_processing: return
+        folder=filedialog.askdirectory(title='Choose mod root folder')
         if folder:
-            self.path_var.set(folder)
-            self.logic.set_mod_path(folder)
-            self.save_config()
-            self.log_message(f"Selected Mod Path: {folder}")
+            self.logic.set_mod_path(folder); self.path_var.set(self.logic.mod_path); self.save_config()
+            self.navigate('Overview',self.show_mod_manager_ui)
 
     def browse_vanilla_folder(self):
-        folder = filedialog.askdirectory()
+        if self.is_processing: return
+        folder=filedialog.askdirectory(title='Choose Victoria 3 installation or game folder')
         if folder:
-            self.vanilla_path_var.set(folder)
-            self.logic.set_vanilla_path(folder)
-            self.save_config()
-            self.log_message(f"Selected Vanilla Path: {folder}")
+            self.logic.set_vanilla_path(folder); self.vanilla_path_var.set(self.logic.vanilla_path); self.save_config()
+            self.navigate('Overview',self.show_mod_manager_ui)
 
     def log_message(self, message, level='info'):
         self.log_queue.put((message, level))
 
     def process_log_queue(self):
-        while not self.log_queue.empty():
-            msg, level = self.log_queue.get()
-            self.log_area.config(state='normal')
-            self.log_area.insert(tk.END, msg.strip() + "\n", level)
-            self.log_area.see(tk.END)
-            self.log_area.config(state='disabled')
-        self.after(100, self.process_log_queue)
+        while not self.ui_queue.empty(): self.ui_queue.get_nowait()()
+        for _ in range(200):
+            try: msg,level=self.log_queue.get_nowait()
+            except queue.Empty: break
+            self.log_area.configure(state='normal'); self.log_area.insert('end',str(msg).strip()+'\n',level)
+            self.log_area.see('end'); self.log_area.configure(state='disabled')
+        self.after(100,self.process_log_queue)
 
     def start_transfer(self):
         if self.is_processing: return
@@ -10858,7 +8674,7 @@ class App(tk.Tk):
         capital = self.logic.format_state_clean(self.cr_capital.get())
         others_raw = self.cr_others.get("1.0", tk.END)
         rgb = self.cr_rgb
-        is_annex = self.cr_annex.get()
+        is_annex = self.cr_annex.get() and not self.country_state_owners
 
         tier = self.cr_tier.get()
         country_type = self.cr_type.get()
@@ -10905,7 +8721,7 @@ class App(tk.Tk):
         self.is_processing = True
         self.run_btn.config(state='disabled')
         self.log_area.config(state='normal'); self.log_area.delete('1.0', tk.END); self.log_area.config(state='disabled')
-        threading.Thread(target=self.run_create_logic, args=(tag, name, adj, old_owner, capital, others_raw, rgb, is_annex, cultures, religion, tier, country_type, pop_wealth, pop_lit), daemon=True).start()
+        threading.Thread(target=self.run_create_logic, args=(tag, name, adj, old_owner, capital, others_raw, rgb, is_annex, cultures, religion, tier, country_type, pop_wealth, pop_lit, dict(self.country_state_owners)), daemon=True).start()
 
     # --- LOGIC THREADS ---
     def run_transfer_logic(self, old_tags_input, new_tag, mode, raw_states):
@@ -10975,7 +8791,7 @@ class App(tk.Tk):
             self.is_processing = False
             self.after(0, lambda: self.run_btn.config(state='normal'))
 
-    def run_create_logic(self, tag, name, adj, old_owner, capital, others_raw, rgb, is_annex, cultures, religion, tier, country_type, pop_wealth, pop_lit):
+    def run_create_logic(self, tag, name, adj, old_owner, capital, others_raw, rgb, is_annex, cultures, religion, tier, country_type, pop_wealth, pop_lit, state_owners=None):
         try:
             self.log_message(f"--- Creating Country: {tag} ({name}) ---", 'info')
             if self.logic.tag_exists(tag):
@@ -11020,15 +8836,22 @@ class App(tk.Tk):
                      self.log_message(f"[INFO] Full annexation detected (implicit).", 'info')
                      should_cleanup = True
 
+            grouped = {}
+            for state in dict.fromkeys(all_states):
+                owner = old_owner if is_annex or state == capital else (state_owners or {}).get(state, old_owner)
+                grouped.setdefault(owner, []).append(state)
+            for owner, states in grouped.items():
+                missing = set(states) - set(self.logic.get_all_owned_states(owner))
+                if missing:
+                    raise ValueError(f"{owner} does not own the selected territory: {', '.join(sorted(missing))}")
             self.logic.create_country_files(tag, name, adj, capital, rgb, cultures, religion, tier, country_type, old_owner, pop_wealth, pop_lit)
             
             self.log_message("--- Transferring Land & Units ---", 'info')
 
-            known_owners = [old_owner] if is_annex else None
-            self.logic.perform_transfer_sequence(all_states, tag, known_old_owners=known_owners)
-
-            if should_cleanup:
-                self.logic.perform_annexation_cleanup(old_owner, tag, all_states)
+            for owner, states in grouped.items():
+                self.logic.perform_transfer_sequence(states, tag, known_old_owners=[owner])
+                if not self.logic.get_all_owned_states(owner):
+                    self.logic.perform_annexation_cleanup(owner, tag, states)
         except Exception as e:
             self.log_message(f"CRITICAL ERROR: {str(e)}", 'error')
             traceback.print_exc()
@@ -11312,7 +9135,7 @@ class App(tk.Tk):
         ttk.Entry(col1, textvariable=self.je_title, width=25).pack(anchor=tk.W, pady=2)
 
         ttk.Label(col1, text="Description:").pack(anchor=tk.W)
-        self.je_desc = tk.Text(col1, height=5, width=25, bg="#424242", fg="#ECEFF1", relief="flat")
+        self.je_desc = tk.Text(col1, height=5, width=25, bg="#473a2b", fg="#f3e7ce", relief="flat")
         self.je_desc.pack(anchor=tk.W, pady=2)
 
         ttk.Label(col1, text="Icon: event_default.dds").pack(anchor=tk.W, pady=10)
@@ -11322,7 +9145,7 @@ class App(tk.Tk):
 
         # Activation
         ttk.Label(col2, text="Activation (Possible):").pack(anchor=tk.W)
-        self.lb_je_activation = tk.Listbox(col2, height=6, bg="#424242", fg="#ECEFF1")
+        self.lb_je_activation = tk.Listbox(col2, height=6, bg="#473a2b", fg="#f3e7ce")
         self.lb_je_activation.pack(fill=tk.X, pady=2)
 
         act_ctrl = ttk.Frame(col2)
@@ -11335,7 +9158,7 @@ class App(tk.Tk):
 
         # Completion
         ttk.Label(col2, text="Completion (Complete):").pack(anchor=tk.W, pady=(10, 0))
-        self.lb_je_completion = tk.Listbox(col2, height=6, bg="#424242", fg="#ECEFF1")
+        self.lb_je_completion = tk.Listbox(col2, height=6, bg="#473a2b", fg="#f3e7ce")
         self.lb_je_completion.pack(fill=tk.X, pady=2)
 
         comp_ctrl = ttk.Frame(col2)
@@ -11349,7 +9172,7 @@ class App(tk.Tk):
         # --- Column 3: Rewards ---
         ttk.Label(col3, text="Rewards (On Complete)", font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, pady=5)
 
-        self.lb_je_rewards = tk.Listbox(col3, height=15, bg="#424242", fg="#ECEFF1")
+        self.lb_je_rewards = tk.Listbox(col3, height=15, bg="#473a2b", fg="#f3e7ce")
         self.lb_je_rewards.pack(fill=tk.X, pady=2)
 
         rew_ctrl = ttk.Frame(col3)
@@ -11411,18 +9234,22 @@ class App(tk.Tk):
         ttk.Entry(left_f, textvariable=self.evt_title).grid(row=3, column=1, sticky=tk.EW, pady=2)
 
         ttk.Label(left_f, text="Description:").grid(row=4, column=0, sticky=tk.NW)
-        self.evt_desc = tk.Text(left_f, height=3, width=30, bg="#424242", fg="#ECEFF1", relief="flat")
+        self.evt_desc = tk.Text(left_f, height=3, width=30, bg="#473a2b", fg="#f3e7ce", relief="flat")
         self.evt_desc.grid(row=4, column=1, sticky=tk.EW, pady=2)
 
         ttk.Label(left_f, text="Flavor Text:").grid(row=5, column=0, sticky=tk.NW)
-        self.evt_flav = tk.Text(left_f, height=2, width=30, bg="#424242", fg="#ECEFF1", relief="flat")
+        self.evt_flav = tk.Text(left_f, height=2, width=30, bg="#473a2b", fg="#f3e7ce", relief="flat")
         self.evt_flav.grid(row=5, column=1, sticky=tk.EW, pady=2)
+
+        ttk.Label(left_f, text="Event video key:").grid(row=6,column=0,sticky=tk.W)
+        self.evt_video = tk.StringVar(value="ep1_clandestine_meeting")
+        ttk.Entry(left_f,textvariable=self.evt_video).grid(row=6,column=1,sticky=tk.EW,pady=2)
 
         # --- Event Options (Right) ---
         right_f = ttk.LabelFrame(top_pane, text="Options (Buttons)", padding=10)
         right_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.evt_opts_list = tk.Listbox(right_f, height=8, bg="#424242", fg="#ECEFF1")
+        self.evt_opts_list = tk.Listbox(right_f, height=8, bg="#473a2b", fg="#f3e7ce")
         self.evt_opts_list.pack(fill=tk.BOTH, expand=True, pady=2)
 
         btn_ctrl = ttk.Frame(right_f)
@@ -11466,7 +9293,7 @@ class App(tk.Tk):
         ttk.Entry(def_f, textvariable=self.mod_loc_desc, width=30).grid(row=1, column=3, padx=5)
 
         ttk.Label(def_f, text="Effects (e.g. unit_offense_mult = 0.1):").grid(row=2, column=0, sticky=tk.NW, pady=5)
-        self.mod_effects = tk.Text(def_f, height=3, width=50, bg="#424242", fg="#ECEFF1", relief="flat")
+        self.mod_effects = tk.Text(def_f, height=3, width=50, bg="#473a2b", fg="#f3e7ce", relief="flat")
         self.mod_effects.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=5, pady=5)
 
         ttk.Button(def_f, text="Save Modifier", command=self.save_modifier_ui).grid(row=3, column=3, sticky=tk.E)
@@ -11479,7 +9306,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Add Option")
         win.geometry("500x600")
-        win.configure(bg="#212121")
+        win.configure(bg="#28231d")
 
         # Name
         ttk.Label(win, text="Option Name (Button Text):").pack(pady=5)
@@ -11637,7 +9464,7 @@ class App(tk.Tk):
         tit = self.evt_title.get().strip()
         desc = self.evt_desc.get("1.0", tk.END).strip()
         flav = self.evt_flav.get("1.0", tk.END).strip()
-        img = "ep1_clandestine_meeting"
+        img = self.evt_video.get().strip()
 
         if not namespace or not eid or not tit: return messagebox.showerror("Error", "Namespace, Event ID, and Title required.")
 
@@ -11687,6 +9514,7 @@ class App(tk.Tk):
         self.evt_ns_input.set(data.get('namespace', ''))
         self.evt_id_input.set(evt_id)
         self.evt_title.set(data.get('title', ''))
+        self.evt_video.set(data.get('image', ''))
 
         self.evt_desc.delete("1.0", tk.END)
         self.evt_desc.insert(tk.END, data.get('desc', ''))
@@ -11864,6 +9692,7 @@ class App(tk.Tk):
         e_st.pack(side=tk.LEFT, padx=5)
         e_st.bind("<Return>", lambda e: self.load_state_manager_data())
         ttk.Button(sel_frame, text="Load State Data", command=self.load_state_manager_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(sel_frame, text="Select from map", command=lambda: self.open_editor_picker("state", self.select_map_state)).pack(side=tk.LEFT, padx=5)
 
         # 2. Homelands & Buildings
         hb_container = ttk.Frame(f)
@@ -11873,7 +9702,7 @@ class App(tk.Tk):
         h_frame = ttk.LabelFrame(hb_container, text="Homelands", padding=10)
         h_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
 
-        self.lb_homelands = tk.Listbox(h_frame, height=6, bg="#424242", fg="#ECEFF1")
+        self.lb_homelands = tk.Listbox(h_frame, height=6, bg="#473a2b", fg="#f3e7ce")
         self.lb_homelands.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
 
         h_ctrl = ttk.Frame(h_frame)
@@ -11892,7 +9721,7 @@ class App(tk.Tk):
         b_frame = ttk.LabelFrame(hb_container, text="Buildings", padding=10)
         b_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
 
-        self.lb_buildings = tk.Listbox(b_frame, height=6, bg="#424242", fg="#ECEFF1", selectmode=tk.EXTENDED, exportselection=False)
+        self.lb_buildings = tk.Listbox(b_frame, height=6, bg="#473a2b", fg="#f3e7ce", selectmode=tk.EXTENDED, exportselection=False)
         self.lb_buildings.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
         self.lb_buildings.bind('<<ListboxSelect>>', self.on_building_select)
 
@@ -12549,7 +10378,7 @@ class App(tk.Tk):
         # Popup to select Culture/Religion
         win = tk.Toplevel(self)
         win.title("Add Group")
-        win.configure(bg="#212121")
+        win.configure(bg="#28231d")
 
         c_opts, _, _, _, _, _ = self.logic.scan_culture_definitions()
         all_culs = sorted(list(c_opts.keys()))
@@ -12558,11 +10387,11 @@ class App(tk.Tk):
         _, def_rels, _, _ = self.logic.scan_definitions_for_options()
         all_rels = sorted(list(set(r_opts + def_rels)))
 
-        ttk.Label(win, text="Culture:", background="#212121", foreground="white").pack(pady=5)
+        ttk.Label(win, text="Culture:", background="#28231d", foreground="white").pack(pady=5)
         cb_c = ttk.Combobox(win, values=all_culs)
         cb_c.pack(padx=10)
 
-        ttk.Label(win, text="Religion:", background="#212121", foreground="white").pack(pady=5)
+        ttk.Label(win, text="Religion:", background="#28231d", foreground="white").pack(pady=5)
         cb_r = ttk.Combobox(win, values=all_rels)
         cb_r.pack(padx=10)
 
@@ -12637,52 +10466,23 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.logic = logic
         self.parent = parent
         self.start_mode = start_mode
-        self.configure(bg="#212121")
+        self.configure(bg="#28231d")
 
         if not PIL_AVAILABLE:
-            tk.Label(self, text="Error: Pillow (PIL) or Numpy not installed.\nCannot open map painter.", fg="red", bg="#212121").pack(expand=True)
+            tk.Label(self, text="Error: Pillow (PIL) or Numpy not installed.\nCannot open map painter.", fg="red", bg="#28231d").pack(expand=True)
             return
 
         # Data Containers
         self.original_map_image = None # Original Full-Res PIL Image
-        self.original_rgb_array = None
         self.display_image = None # Tkinter Image
-        self.canvas_image_id = None
         self.province_to_state = {} # hex -> state_name
         self.state_province_map = {} # state_name -> [hex, hex, ...]
         self.province_owner_map = {} # hex -> owner_tag
         self.country_colors = {} # tag -> (r,g,b)
-        self.province_indices = None # Backward-compatible alias kept for older checks
-        self.province_rgb_array = None
-        self.province_label_map = None
-        self.packed_hex_cache = {}
-        self.unique_province_values = np.array([], dtype=np.int32)
-        self.unique_province_hexes = []
-        self.province_value_to_label = {}
-        self.province_bounds = {}
-        self.province_region_cache = {}
-        self.selection_overlay_items = {}
-        self.base_render_array = None
-        self.base_render_mode = None
-        self.base_render_scale = None
-        self.selected_packed_values = np.array([], dtype=np.int32)
-        self.selected_fill_colors = {}
-        self.impassable_provinces = set()
-        self.impassable_packed_values = np.array([], dtype=np.int32)
+        self.province_indices = None # Numpy array of hex colors (or mapped indices)
         self.map_width = 0
         self.map_height = 0
-        self.source_width = 0
-        self.source_height = 0
         self.scale_factor = 0.25
-        self._load_request_id = 0
-        self._zoom_after_id = None
-        self._zoom_anchor = None
-        self._is_panning = False
-        self._viewport_after_id = None
-        self._left_drag_start = None
-        self._left_drag_active = False
-        self._left_drag_box_id = None
-        self._left_drag_threshold = 6
 
         self.pending_transfers = [] # List of (state, old_tag, new_tag)
 
@@ -12690,734 +10490,12 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.view_mode = "POLITICAL" # POLITICAL, PROVINCE, CUSTOM_STATE
         self.selected_provinces = set() # Set of hex strings
         self.custom_target_state = None # For Custom State Mode
-        self.pending_state_creation = None
-        self.pending_hub_step = None
-        self.impassable_mode = False
 
         if self.start_mode == "CUSTOM_STATE":
             self.view_mode = "PROVINCE" # Start showing provinces
 
         self._build_ui()
         self.after(100, self.start_loading)
-
-    def _invalidate_base_render(self):
-        self.base_render_array = None
-        self.base_render_mode = None
-        self.base_render_scale = None
-
-    def _clear_scaled_map_cache(self):
-        self._clear_selection_overlays()
-        self.province_indices = None
-        self.province_rgb_array = None
-        self.province_label_map = None
-        self.packed_hex_cache = {}
-        self.unique_province_values = np.array([], dtype=np.int32)
-        self.unique_province_hexes = []
-        self.province_value_to_label = {}
-        self.province_bounds = {}
-        self.province_region_cache = {}
-        self._invalidate_base_render()
-
-    def _refresh_selected_cache(self):
-        if not self.selected_provinces:
-            self.selected_packed_values = np.array([], dtype=np.int32)
-            self.selected_fill_colors = {}
-            return
-
-        packed_values = []
-        fill_colors = {}
-
-        for hex_code in self.selected_provinces:
-            try:
-                packed = self._hex_to_packed_rgb(hex_code)
-            except ValueError:
-                continue
-
-            packed_values.append(packed)
-            fallback_color = (
-                (packed >> 16) & 0xFF,
-                (packed >> 8) & 0xFF,
-                packed & 0xFF,
-            )
-            fill_colors[packed] = self._get_selected_fill_color(hex_code, fallback_color)
-
-        self.selected_packed_values = (
-            np.array(packed_values, dtype=np.int32)
-            if packed_values
-            else np.array([], dtype=np.int32)
-        )
-        self.selected_fill_colors = fill_colors
-
-    def _refresh_impassable_cache(self):
-        impassable = set()
-        for state_id, sobj in self.logic.state_manager.states.items():
-            province_set = {p.lower() for p in sobj.provinces}
-            for province_hex in sobj.impassable:
-                clean_hex = province_hex.lower()
-                if clean_hex in province_set and self.logic.state_manager.province_owner_map.get(clean_hex) == state_id:
-                    impassable.add(clean_hex)
-
-        self.impassable_provinces = impassable
-        packed_values = []
-        for hex_code in impassable:
-            try:
-                packed_values.append(self._hex_to_packed_rgb(hex_code))
-            except ValueError:
-                continue
-
-        self.impassable_packed_values = (
-            np.array(packed_values, dtype=np.int32)
-            if packed_values
-            else np.array([], dtype=np.int32)
-        )
-
-    def _supports_drag_box(self):
-        if self.pending_state_creation and self.pending_hub_step:
-            return False
-        return self.impassable_mode or self.view_mode == "PROVINCE" or self.start_mode == "CUSTOM_STATE"
-
-    def _clear_drag_box(self):
-        if self._left_drag_box_id is not None:
-            self.canvas.delete(self._left_drag_box_id)
-            self._left_drag_box_id = None
-
-    def _get_canvas_event_point(self, event):
-        return self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
-
-    def _get_hexes_in_canvas_box(self, x0, y0, x1, y1):
-        if self.original_rgb_array is None:
-            return set()
-
-        left = max(int(min(x0, x1)), 0)
-        top = max(int(min(y0, y1)), 0)
-        right = min(int(max(x0, x1)), self.map_width - 1)
-        bottom = min(int(max(y0, y1)), self.map_height - 1)
-
-        if right < left or bottom < top:
-            return set()
-
-        scale = max(self.scale_factor, 0.0001)
-        src_left = min(int(left / scale), self.source_width - 1)
-        src_top = min(int(top / scale), self.source_height - 1)
-        src_right = min(int(right / scale), self.source_width - 1)
-        src_bottom = min(int(bottom / scale), self.source_height - 1)
-
-        rgb_slice = self.original_rgb_array[src_top:src_bottom + 1, src_left:src_right + 1]
-        if rgb_slice.size == 0:
-            return set()
-
-        packed_slice = (
-            rgb_slice[:, :, 0].astype(np.int32) << 16
-        ) + (
-            rgb_slice[:, :, 1].astype(np.int32) << 8
-        ) + rgb_slice[:, :, 2].astype(np.int32)
-
-        province_hexes = set()
-        for packed in np.unique(packed_slice.reshape(-1)).tolist():
-            hex_code = self._packed_to_hex(packed)
-            if self.impassable_mode:
-                owner_state = self.logic.state_manager.province_owner_map.get(hex_code)
-                if owner_state and owner_state in self.logic.state_manager.states:
-                    province_hexes.add(hex_code)
-            else:
-                if hex_code in self.province_to_state:
-                    province_hexes.add(hex_code)
-
-        return province_hexes
-
-    def _apply_box_selection(self, province_hexes):
-        if not province_hexes:
-            self._set_default_status(prefix="Selection box did not cover any state provinces.")
-            return
-
-        new_provinces = province_hexes - self.selected_provinces
-        if not new_provinces:
-            self._set_default_status(prefix=f"Selection box covered {len(province_hexes)} provinces; all were already selected.")
-            return
-
-        self.selected_provinces.update(new_provinces)
-        self._refresh_selected_cache()
-        self.refresh_map()
-        self.status_var.set(f"Selected {len(new_provinces)} provinces from box. Total selected: {len(self.selected_provinces)}.")
-
-    def _apply_impassable_box(self, province_hexes):
-        if not province_hexes:
-            self._set_default_status(prefix="Selection box did not cover any owned state provinces.")
-            return
-
-        marked_count, already_marked, affected_states = self.logic.state_manager.mark_provinces_impassable(province_hexes)
-        total_box = len(province_hexes)
-
-        if affected_states:
-            self._refresh_impassable_cache()
-            self.refresh_map()
-            state_count = len(affected_states)
-            if marked_count > 0:
-                already_suffix = f" ({already_marked} already impassable)." if already_marked else "."
-                self.status_var.set(
-                    f"Marked {marked_count} provinces impassable from box across {state_count} state{'s' if state_count != 1 else ''}{already_suffix}"
-                )
-            elif already_marked > 0:
-                self.status_var.set(f"All {already_marked} provinces in box were already impassable.")
-            else:
-                self.status_var.set(f"Updated impassable entries across {state_count} state{'s' if state_count != 1 else ''}.")
-            return
-
-        if already_marked == total_box:
-            self.status_var.set(f"All {already_marked} provinces in box were already impassable.")
-        else:
-            self._set_default_status(prefix="No impassable changes were needed for the selection box.")
-
-    def _capture_view_anchor(self, event=None):
-        canvas_width = max(1, self.canvas.winfo_width())
-        canvas_height = max(1, self.canvas.winfo_height())
-
-        if event is not None:
-            screen_x = min(max(event.x, 0), canvas_width)
-            screen_y = min(max(event.y, 0), canvas_height)
-        else:
-            screen_x = canvas_width / 2
-            screen_y = canvas_height / 2
-
-        return {
-            "world_x": self.canvas.canvasx(screen_x) / max(self.scale_factor, 0.0001),
-            "world_y": self.canvas.canvasy(screen_y) / max(self.scale_factor, 0.0001),
-            "rel_x": screen_x / canvas_width,
-            "rel_y": screen_y / canvas_height,
-        }
-
-    def _restore_view_anchor(self, anchor):
-        if not anchor:
-            return
-
-        self.update_idletasks()
-        canvas_width = max(1, self.canvas.winfo_width())
-        canvas_height = max(1, self.canvas.winfo_height())
-
-        rel_x = min(max(anchor.get("rel_x", 0.5), 0.0), 1.0)
-        rel_y = min(max(anchor.get("rel_y", 0.5), 0.0), 1.0)
-
-        anchor_x = anchor.get("world_x", 0.0) * self.scale_factor
-        anchor_y = anchor.get("world_y", 0.0) * self.scale_factor
-
-        left = anchor_x - (canvas_width * rel_x)
-        top = anchor_y - (canvas_height * rel_y)
-
-        if self.map_width <= canvas_width:
-            x_fraction = 0.0
-        else:
-            max_x_fraction = 1.0 - (canvas_width / max(self.map_width, 1))
-            x_fraction = min(max(left / max(self.map_width, 1), 0.0), max_x_fraction)
-
-        if self.map_height <= canvas_height:
-            y_fraction = 0.0
-        else:
-            max_y_fraction = 1.0 - (canvas_height / max(self.map_height, 1))
-            y_fraction = min(max(top / max(self.map_height, 1), 0.0), max_y_fraction)
-
-        self.canvas.xview_moveto(x_fraction)
-        self.canvas.yview_moveto(y_fraction)
-
-    def _queue_viewport_refresh(self, delay=0):
-        if self._viewport_after_id is not None:
-            self.after_cancel(self._viewport_after_id)
-        self._viewport_after_id = self.after(delay, self._run_viewport_refresh)
-
-    def _run_viewport_refresh(self):
-        self._viewport_after_id = None
-        self.refresh_map()
-
-    def _update_virtual_map_size(self):
-        self.map_width = max(int(round(self.source_width * self.scale_factor)), 1)
-        self.map_height = max(int(round(self.source_height * self.scale_factor)), 1)
-
-    def _get_default_status_message(self):
-        if self.pending_state_creation and self.pending_hub_step:
-            labels = {
-                "city": "City",
-                "farm": "Farm",
-                "mine": "Mine",
-                "wood": "Wood",
-                "port": "Port"
-            }
-            label = labels.get(self.pending_hub_step, self.pending_hub_step.title())
-            return f"Hub selection: click a selected province for the {label} hub."
-        if self.impassable_mode:
-            return "Impassable mode: left click to toggle one province, or drag a box to mark many impassable."
-        if self.start_mode == "CUSTOM_STATE":
-            return "Ready. Left click or drag a box to select provinces, right click to set target state."
-        if self.view_mode == "PROVINCE":
-            return "Province selector: left click or drag a box to select provinces."
-        return "Ready. Left Click to Paint, Right Click to Pick."
-
-    def _set_default_status(self, prefix=None):
-        message = self._get_default_status_message()
-        if prefix:
-            message = f"{prefix} {message}"
-        self.status_var.set(message)
-
-    def _cancel_pending_state_creation(self, show_message=False):
-        self.pending_state_creation = None
-        self.pending_hub_step = None
-        if show_message:
-            messagebox.showinfo("Cancelled", "State creation cancelled.")
-        self._set_default_status()
-
-    def _prompt_localization_value(self, prompt, default_value):
-        value = simpledialog.askstring(
-            "Create State",
-            prompt,
-            initialvalue=default_value
-        )
-        if value is None:
-            return default_value
-        value = value.strip()
-        return value if value else default_value
-
-    def _prompt_state_localization_names(self, state_id, fallback_state_name):
-        sobj = self.logic.state_manager.states.get(state_id)
-        if not sobj:
-            return
-
-        state_default = self.logic.get_loc_text(state_id)
-        if state_default == state_id:
-            state_default = fallback_state_name
-
-        state_loc_name = self._prompt_localization_value(
-            "Enter State localization name:",
-            state_default
-        )
-
-        hub_defaults = {
-            "city": "City",
-            "farm": "Farms",
-            "mine": "Mines",
-            "wood": "Logging Camps",
-            "port": "Port"
-        }
-        hub_names = {}
-        for hub_type, suffix in hub_defaults.items():
-            if not sobj.hubs.get(hub_type):
-                continue
-
-            hub_key = f"HUB_NAME_{state_id}_{hub_type}"
-            default_name = self.logic.get_loc_text(hub_key)
-            if default_name == hub_key:
-                default_name = f"{state_loc_name} {suffix}"
-
-            hub_names[hub_type] = self._prompt_localization_value(
-                f"Enter {hub_type.title()} hub localization name:",
-                default_name
-            )
-
-        self.logic.state_manager._update_localization(
-            state_id,
-            state_loc_name,
-            hub_names=hub_names,
-            overwrite_existing=True
-        )
-
-    def _begin_hub_selection(self, name, owner_data, numeric_id):
-        province_list = list(self.selected_provinces)
-        if isinstance(owner_data, dict):
-            stored_owner_data = {tag: list(provs) for tag, provs in owner_data.items()}
-        else:
-            stored_owner_data = owner_data
-
-        self.pending_state_creation = {
-            "name": name,
-            "owner_data": stored_owner_data,
-            "numeric_id": numeric_id,
-            "province_list": province_list,
-            "province_set": set(province_list),
-            "hub_assignments": {}
-        }
-        self.pending_hub_step = "city"
-        self.lift()
-        self.focus_force()
-        messagebox.showinfo(
-            "Hub Selection",
-            "Click a selected province for the City hub.\n\n"
-            "You will then pick Farm, Mine, and Wood hubs on the map. "
-            "Use Clear Selection if you want to cancel."
-        )
-        self._set_default_status()
-
-    def _finalize_pending_state_creation(self):
-        if not self.pending_state_creation:
-            return
-
-        data = self.pending_state_creation
-        hub_assignments = dict(data.get("hub_assignments", {}))
-        naval_exit_id = data.get("naval_exit_id")
-        name = data["name"]
-
-        self.logic.state_manager.create_new_state(
-            name,
-            data["owner_data"],
-            list(data["province_list"]),
-            data["numeric_id"],
-            hub_assignments=hub_assignments,
-            naval_exit_id=naval_exit_id
-        )
-        self._prompt_state_localization_names(self.logic.normalize_state_key(name), name)
-
-        self.pending_state_creation = None
-        self.pending_hub_step = None
-        self.selected_provinces.clear()
-        self._refresh_selected_cache()
-        self.reload_data()
-        messagebox.showinfo("Success", f"Created state {name}.")
-
-    def _handle_hub_selection_click(self, hex_code):
-        data = self.pending_state_creation
-        if not data or not self.pending_hub_step:
-            return
-
-        if hex_code not in data["province_set"]:
-            self._set_default_status(prefix=f"{hex_code} is not part of the new state.")
-            return
-
-        current_step = self.pending_hub_step
-        data["hub_assignments"][current_step] = hex_code
-
-        next_steps = {
-            "city": "farm",
-            "farm": "mine",
-            "mine": "wood"
-        }
-
-        if current_step in next_steps:
-            self.pending_hub_step = next_steps[current_step]
-            self._set_default_status(prefix=f"{current_step.title()} hub set to {hex_code}.")
-            return
-
-        if current_step == "wood":
-            self.pending_hub_step = None
-            has_port = messagebox.askyesno("Create State", "Does this state have a port?")
-            if has_port:
-                self.pending_hub_step = "port"
-                self._set_default_status(prefix=f"Wood hub set to {hex_code}.")
-            else:
-                data["hub_assignments"]["port"] = None
-                data["naval_exit_id"] = None
-                self._finalize_pending_state_creation()
-            return
-
-        if current_step == "port":
-            naval_exit_id = simpledialog.askinteger(
-                "Create State",
-                "Enter Naval Exit ID:",
-                minvalue=1
-            )
-            if naval_exit_id is None:
-                self._cancel_pending_state_creation(show_message=True)
-                return
-            data["naval_exit_id"] = str(naval_exit_id)
-            self.pending_hub_step = None
-            self._finalize_pending_state_creation()
-
-    def _get_visible_viewport(self):
-        if self.original_rgb_array is None:
-            return None
-
-        self.update_idletasks()
-        canvas_width = max(1, self.canvas.winfo_width())
-        canvas_height = max(1, self.canvas.winfo_height())
-        view_left = max(int(self.canvas.canvasx(0)), 0)
-        view_top = max(int(self.canvas.canvasy(0)), 0)
-
-        x1 = min(view_left + canvas_width, self.map_width)
-        y1 = min(view_top + canvas_height, self.map_height)
-        render_width = max(x1 - view_left, 0)
-        render_height = max(y1 - view_top, 0)
-
-        final_img = np.zeros((canvas_height, canvas_width, 3), dtype=np.uint8)
-        final_packed = None
-
-        if render_width <= 0 or render_height <= 0:
-            return {
-                "image": final_img,
-                "packed": final_packed,
-                "canvas_width": canvas_width,
-                "canvas_height": canvas_height,
-                "view_left": view_left,
-                "view_top": view_top,
-            }
-
-        display_x = view_left + np.arange(render_width, dtype=np.float32)
-        display_y = view_top + np.arange(render_height, dtype=np.float32)
-        src_x = np.clip((display_x / self.scale_factor).astype(np.int32), 0, self.source_width - 1)
-        src_y = np.clip((display_y / self.scale_factor).astype(np.int32), 0, self.source_height - 1)
-
-        visible_rgb = self.original_rgb_array[src_y[:, None], src_x[None, :]]
-        visible_packed = (
-            visible_rgb[:, :, 0].astype(np.int32) << 16
-        ) + (
-            visible_rgb[:, :, 1].astype(np.int32) << 8
-        ) + visible_rgb[:, :, 2].astype(np.int32)
-
-        final_img[:render_height, :render_width] = visible_rgb
-        final_packed = visible_packed
-
-        return {
-            "image": final_img,
-            "packed": final_packed,
-            "canvas_width": canvas_width,
-            "canvas_height": canvas_height,
-            "view_left": view_left,
-            "view_top": view_top,
-            "render_width": render_width,
-            "render_height": render_height,
-        }
-
-    def _queue_zoom(self, new_scale, anchor=None):
-        clamped_scale = min(max(new_scale, 0.05), 2.0)
-        if abs(clamped_scale - self.scale_factor) < 0.0001:
-            return
-
-        if anchor is None:
-            anchor = self._capture_view_anchor()
-
-        self.scale_factor = clamped_scale
-        self._zoom_anchor = anchor
-
-        if self._zoom_after_id is not None:
-            self.after_cancel(self._zoom_after_id)
-
-        self.status_var.set(f"Zooming to {int(round(self.scale_factor * 100))}%...")
-        self._zoom_after_id = self.after(10, self._apply_zoom)
-
-    def _apply_zoom(self):
-        self._zoom_after_id = None
-        if self.original_rgb_array is None:
-            return
-
-        try:
-            anchor = self._zoom_anchor
-            self._update_virtual_map_size()
-            self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
-            self._restore_view_anchor(anchor)
-            self.refresh_map()
-            self._set_default_status()
-        except Exception as e:
-            self.status_var.set(f"Error: {e}")
-            traceback.print_exc()
-        finally:
-            self._zoom_anchor = None
-
-    def _build_province_bounds(self):
-        self.province_bounds = {}
-        if self.province_indices is None:
-            return
-
-        if self.province_label_map is not None and len(self.unique_province_values) > 0:
-            label_count = len(self.unique_province_values)
-            min_x = np.full(label_count, self.map_width, dtype=np.int32)
-            max_x = np.full(label_count, -1, dtype=np.int32)
-            min_y = np.full(label_count, self.map_height, dtype=np.int32)
-            max_y = np.full(label_count, -1, dtype=np.int32)
-
-            for y in range(self.map_height):
-                row = self.province_label_map[y]
-                seen, first_idx = np.unique(row, return_index=True)
-                if seen.size == 0:
-                    continue
-
-                _, reverse_idx = np.unique(row[::-1], return_index=True)
-                last_idx = (self.map_width - 1) - reverse_idx
-
-                np.minimum.at(min_x, seen, first_idx)
-                np.maximum.at(max_x, seen, last_idx)
-                np.minimum.at(min_y, seen, y)
-                np.maximum.at(max_y, seen, y)
-
-            for label in range(label_count):
-                if max_x[label] >= 0 and max_y[label] >= 0:
-                    self.province_bounds[label] = (
-                        int(min_x[label]),
-                        int(min_y[label]),
-                        int(max_x[label]),
-                        int(max_y[label]),
-                    )
-            return
-
-        for y in range(self.map_height):
-            row = self.province_indices[y]
-            seen, first_idx = np.unique(row, return_index=True)
-            if seen.size == 0:
-                continue
-
-            _, reverse_idx = np.unique(row[::-1], return_index=True)
-            last_idx = (self.map_width - 1) - reverse_idx
-
-            for packed_value, first_x, last_x in zip(seen.tolist(), first_idx.tolist(), last_idx.tolist()):
-                packed_key = int(packed_value)
-                bounds = self.province_bounds.get(packed_key)
-                if bounds is None:
-                    self.province_bounds[packed_key] = [int(first_x), y, int(last_x), y]
-                else:
-                    if first_x < bounds[0]:
-                        bounds[0] = int(first_x)
-                    if last_x > bounds[2]:
-                        bounds[2] = int(last_x)
-                    bounds[3] = y
-
-    def _packed_to_hex(self, packed):
-        packed_key = int(packed)
-        cached = self.packed_hex_cache.get(packed_key)
-        if cached is not None:
-            return cached
-
-        hex_code = "x{:02x}{:02x}{:02x}".format(
-            (packed_key >> 16) & 0xFF,
-            (packed_key >> 8) & 0xFF,
-            packed_key & 0xFF,
-        )
-        self.packed_hex_cache[packed_key] = hex_code
-        return hex_code
-
-    def _get_hex_at_canvas_pixel(self, ix, iy):
-        if self.original_rgb_array is None:
-            return None
-        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height:
-            return None
-
-        src_x = min(int(ix / max(self.scale_factor, 0.0001)), self.source_width - 1)
-        src_y = min(int(iy / max(self.scale_factor, 0.0001)), self.source_height - 1)
-        rgb = self.original_rgb_array[src_y, src_x]
-        packed = (int(rgb[0]) << 16) + (int(rgb[1]) << 8) + int(rgb[2])
-        return self._packed_to_hex(packed)
-
-    def _get_label_for_hex(self, hex_code):
-        try:
-            packed = self._hex_to_packed_rgb(hex_code)
-        except ValueError:
-            return None
-        return self.province_value_to_label.get(packed)
-
-    def _get_province_region_data(self, hex_code):
-        packed = self._hex_to_packed_rgb(hex_code)
-        cache_key = packed
-        compare_value = packed
-        source_array = self.province_indices
-
-        if self.province_label_map is not None:
-            label = self._get_label_for_hex(hex_code)
-            if label is None:
-                return None
-            cache_key = label
-            compare_value = label
-            source_array = self.province_label_map
-
-        cached = self.province_region_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        bounds = self.province_bounds.get(cache_key)
-        if not bounds:
-            return None
-
-        min_x, min_y, max_x, max_y = bounds
-        x0 = max(min_x - 1, 0)
-        y0 = max(min_y - 1, 0)
-        x1 = min(max_x + 2, self.map_width)
-        y1 = min(max_y + 2, self.map_height)
-
-        value_slice = source_array[y0:y1, x0:x1]
-        selected_mask = value_slice == compare_value
-        outline_mask = self._get_selected_outline_mask(selected_mask, value_slice)
-
-        region_data = (x0, y0, x1, y1, selected_mask, outline_mask)
-        self.province_region_cache[cache_key] = region_data
-        return region_data
-
-    def _clear_selection_overlays(self):
-        for overlay in self.selection_overlay_items.values():
-            self.canvas.delete(overlay["item"])
-        self.selection_overlay_items = {}
-
-    def _sync_selection_overlays(self, full_refresh=False):
-        if full_refresh:
-            self._clear_selection_overlays()
-
-        selected = set(self.selected_provinces)
-        existing = set(self.selection_overlay_items)
-
-        for hex_code in existing - selected:
-            overlay = self.selection_overlay_items.pop(hex_code, None)
-            if overlay is not None:
-                self.canvas.delete(overlay["item"])
-
-        if self.province_indices is None:
-            return
-
-        base_render = self._get_base_render()
-        outline_color = np.array([18, 18, 18], dtype=np.uint8)
-
-        for hex_code in selected:
-            region_data = self._get_province_region_data(hex_code)
-            if region_data is None:
-                continue
-
-            x0, y0, x1, y1, selected_mask, outline_mask = region_data
-            overlay_rgba = np.zeros((y1 - y0, x1 - x0, 4), dtype=np.uint8)
-
-            if self.view_mode == "POLITICAL" and base_render is not None:
-                base_region = base_render[y0:y1, x0:x1]
-                selected_pixels = base_region[selected_mask].astype(np.uint16)
-                overlay_rgba[selected_mask, :3] = ((selected_pixels * 7) + (255 * 3)) // 10
-            else:
-                packed = self._hex_to_packed_rgb(hex_code)
-                fallback_color = (
-                    (packed >> 16) & 0xFF,
-                    (packed >> 8) & 0xFF,
-                    packed & 0xFF,
-                )
-                overlay_rgba[selected_mask, :3] = self._get_selected_fill_color(hex_code, fallback_color)
-
-            overlay_rgba[selected_mask, 3] = 255
-            overlay_rgba[outline_mask, :3] = outline_color
-            overlay_rgba[outline_mask, 3] = 255
-
-            photo = ImageTk.PhotoImage(Image.fromarray(overlay_rgba, mode="RGBA"))
-            existing_overlay = self.selection_overlay_items.get(hex_code)
-            if existing_overlay is None:
-                item_id = self.canvas.create_image(x0, y0, image=photo, anchor="nw")
-                self.selection_overlay_items[hex_code] = {"item": item_id, "image": photo}
-            else:
-                self.canvas.itemconfig(existing_overlay["item"], image=photo)
-                self.canvas.coords(existing_overlay["item"], x0, y0)
-                existing_overlay["image"] = photo
-
-    def _get_base_render(self):
-        if self.province_indices is None:
-            return None
-
-        if (
-            self.base_render_array is not None
-            and self.base_render_mode == self.view_mode
-            and self.base_render_scale == self.scale_factor
-        ):
-            return self.base_render_array
-
-        if self.view_mode == "PROVINCE" or self.province_label_map is None:
-            base = self.province_rgb_array
-        else:
-            default_color = (50, 50, 50)
-            palette = np.full((len(self.unique_province_values), 3), 50, dtype=np.uint8)
-
-            for label, hex_code in enumerate(self.unique_province_hexes):
-                owner = self.province_owner_map.get(hex_code)
-                if owner:
-                    palette[label] = self.get_owner_display_color(owner) or default_color
-
-            base = palette[self.province_label_map]
-
-        self.base_render_array = np.ascontiguousarray(base)
-        self.base_render_mode = self.view_mode
-        self.base_render_scale = self.scale_factor
-        return self.base_render_array
 
     def ask_split_choice(self, owners, options=None, default_tag=None):
         """Helper to ask user how to handle multiple owners."""
@@ -13432,7 +10510,7 @@ class Vic3ProvincePainter(tk.Toplevel):
         win.geometry("400x230")
         win.transient(self)
         win.grab_set()
-        win.configure(bg="#212121")
+        win.configure(bg="#28231d")
 
         # Center
         x = self.winfo_rootx() + 100
@@ -13440,24 +10518,24 @@ class Vic3ProvincePainter(tk.Toplevel):
         win.geometry(f"+{x}+{y}")
 
         tk.Label(win, text=f"Multiple owners detected for selected provinces:\n{', '.join(owners)}",
-                 wraplength=380, justify=tk.CENTER, bg="#212121", fg="white").pack(pady=10)
+                 wraplength=380, justify=tk.CENTER, bg="#28231d", fg="white").pack(pady=10)
 
         tk.Label(win, text="How do you wish to proceed?", font=("Segoe UI", 10, "bold"),
-                 bg="#212121", fg="white").pack(pady=5)
+                 bg="#28231d", fg="white").pack(pady=5)
 
         # Split
         def on_split():
             choice[0] = "split"
             win.destroy()
 
-        btn_bg = "#424242"
+        btn_bg = "#473a2b"
         btn_fg = "white"
 
         tk.Button(win, text="Maintain Split State\n(Each tag keeps its provinces)", command=on_split,
                   bg=btn_bg, fg=btn_fg, relief="raised", bd=1).pack(fill=tk.X, padx=20, pady=5)
 
         # Single
-        f_single = tk.Frame(win, bg="#212121")
+        f_single = tk.Frame(win, bg="#28231d")
         f_single.pack(fill=tk.X, padx=20, pady=5)
 
         tk.Button(f_single, text="Transfer All To:", command=lambda: on_single(),
@@ -13483,35 +10561,77 @@ class Vic3ProvincePainter(tk.Toplevel):
 
     def _build_ui(self):
         # Toolbar
-        toolbar = tk.Frame(self, bg="#323232", height=40)
+        toolbar = tk.Frame(self, bg="#352b21", height=40)
         toolbar.pack(fill=tk.X, side=tk.TOP)
 
-        if self.start_mode == "CUSTOM_STATE":
-            tk.Label(toolbar, text="Target State (Right-Click):", bg="#323232", fg="white").pack(side=tk.LEFT, padx=5)
+        if self.start_mode.startswith("PICK_"):
+            kind = self.start_mode[5:].lower()
+            ttk.Label(toolbar, text=f"Click a province to open its {kind}.").pack(side=tk.LEFT,padx=8)
+            ttk.Button(toolbar,text="Cancel",command=self.destroy).pack(side=tk.LEFT)
+            self.bind("<Escape>",lambda event: self.destroy())
+        elif self.start_mode == "COUNTRY":
+            self.pick_mode = tk.StringVar(value="Capital" if not self.parent.cr_capital.get() else "States")
+            for mode in ("Capital", "States"):
+                ttk.Radiobutton(toolbar, text=mode, variable=self.pick_mode, value=mode).pack(side=tk.LEFT, padx=5)
+            ttk.Button(toolbar, text="Country details", command=self.destroy).pack(side=tk.LEFT)
+            self.country_summary = ttk.Label(self, wraplength=740)
+            self.country_summary.pack(side=tk.BOTTOM, fill=tk.X)
+            self.update_country_summary()
+            self.geometry("1080x680")
+            form = self.parent
+            side = ttk.LabelFrame(self, text="Country details", padding=10)
+            side.pack(side=tk.RIGHT, fill=tk.Y)
+            for label, variable in (("Tag",form.cr_tag),("Name",form.cr_name),("Adjective",form.cr_adj)):
+                ttk.Label(side,text=label).pack(anchor="w")
+                ttk.Entry(side,textvariable=variable).pack(fill="x",pady=(0,5))
+            ttk.Label(side,text="Religion").pack(anchor="w")
+            ttk.Combobox(side, textvariable=form.cr_religion, values=["",*form.country_religions],state="readonly").pack(fill="x")
+            ttk.Label(side,text="Add culture").pack(anchor="w")
+            culture = ttk.Combobox(side, values=form.all_cultures_data)
+            culture.pack(fill="x")
+            chosen = ttk.Label(side,text=", ".join(form.selected_cultures),wraplength=180)
+            chosen.pack(anchor="w")
+            def add_selected(event):
+                form.add_culture(culture.get())
+                chosen.configure(text=", ".join(form.selected_cultures))
+            culture.bind("<<ComboboxSelected>>", add_selected)
+            culture_suggestions(culture, form.all_cultures_data, add_selected)
+            def pick_country_colour():
+                choice = colorchooser.askcolor(color=form._rgb_to_hex(form.cr_rgb), parent=self)
+                if choice[0]:
+                    form.cr_rgb = [int(v) for v in choice[0]]
+                    form.color_preview.configure(bg=choice[1])
+                    swatch.configure(bg=choice[1])
+                    self.refresh_map()
+            swatch = tk.Button(side,text="Country colour",bg=form._rgb_to_hex(form.cr_rgb),command=pick_country_colour)
+            swatch.pack(fill="x",pady=6)
+
+            ttk.Button(side,text="Review all options",command=self.destroy).pack(fill="x",pady=8)
+
+        elif self.start_mode == "CUSTOM_STATE":
+            tk.Label(toolbar, text="Target State (Right-Click):", bg="#352b21", fg="white").pack(side=tk.LEFT, padx=5)
             self.target_state_var = tk.StringVar(value="None")
-            tk.Label(toolbar, textvariable=self.target_state_var, bg="#424242", fg="#00ACC1", width=15).pack(side=tk.LEFT, padx=5)
+            tk.Label(toolbar, textvariable=self.target_state_var, bg="#473a2b", fg="#e6bc74", width=15).pack(side=tk.LEFT, padx=5)
 
             tk.Button(toolbar, text="Transfer Selected to Target", command=self.modify_state_action, bg="#FFA726", fg="black").pack(side=tk.LEFT, padx=10)
             tk.Button(toolbar, text="Create New State", command=self.create_new_state_action, bg="#66BB6A", fg="black").pack(side=tk.LEFT, padx=5)
-            self.btn_impassable_mode = tk.Button(toolbar, text="Make Impassable", command=self.toggle_impassable_mode, bg="#8E24AA", fg="white")
-            self.btn_impassable_mode.pack(side=tk.LEFT, padx=5)
-            tk.Button(toolbar, text="Clear Selection", command=self.clear_selection, bg="#424242", fg="white").pack(side=tk.LEFT, padx=5)
+            tk.Button(toolbar, text="Clear Selection", command=self.clear_selection, bg="#473a2b", fg="white").pack(side=tk.LEFT, padx=5)
 
         else:
-            tk.Label(toolbar, text="Paint Tag:", bg="#323232", fg="white").pack(side=tk.LEFT, padx=5)
+            tk.Label(toolbar, text="Paint Tag:", bg="#352b21", fg="white").pack(side=tk.LEFT, padx=5)
             self.paint_tag_var = tk.StringVar()
-            tk.Entry(toolbar, textvariable=self.paint_tag_var, width=10, bg="#424242", fg="white", insertbackground="white").pack(side=tk.LEFT, padx=5)
+            tk.Entry(toolbar, textvariable=self.paint_tag_var, width=10, bg="#473a2b", fg="white", insertbackground="white").pack(side=tk.LEFT, padx=5)
 
-            tk.Button(toolbar, text="Reload Data", command=self.reload_data, bg="#424242", fg="white").pack(side=tk.LEFT, padx=10)
-            tk.Button(toolbar, text="Execute Pending", command=self.execute_changes, bg="#00ACC1", fg="white").pack(side=tk.LEFT, padx=10)
+            tk.Button(toolbar, text="Reload Data", command=self.reload_data, bg="#473a2b", fg="white").pack(side=tk.LEFT, padx=10)
+            tk.Button(toolbar, text="Execute Pending", command=self.execute_changes, bg="#e6bc74", fg="white").pack(side=tk.LEFT, padx=10)
 
         # Zoom Controls
-        tk.Button(toolbar, text="-", command=self.zoom_out, width=3, bg="#424242", fg="white").pack(side=tk.LEFT, padx=(20, 0))
-        tk.Button(toolbar, text="+", command=self.zoom_in, width=3, bg="#424242", fg="white").pack(side=tk.LEFT, padx=(0, 10))
+        tk.Button(toolbar, text="-", command=self.zoom_out, width=3, bg="#473a2b", fg="white").pack(side=tk.LEFT, padx=(20, 0))
+        tk.Button(toolbar, text="+", command=self.zoom_in, width=3, bg="#473a2b", fg="white").pack(side=tk.LEFT, padx=(0, 10))
 
         # View Mode Controls
-        self.btn_prov_mode = tk.Button(toolbar, text="Province Selector", command=self.toggle_view_mode, bg="#424242", fg="white")
-        if self.start_mode != "CUSTOM_STATE":
+        self.btn_prov_mode = tk.Button(toolbar, text="Province Selector", command=self.toggle_view_mode, bg="#473a2b", fg="white")
+        if self.start_mode == "POLITICAL":
             self.btn_prov_mode.pack(side=tk.LEFT, padx=10)
 
         self.btn_export = tk.Button(toolbar, text="Export Selected", command=self.export_selected_provinces, bg="#43A047", fg="white")
@@ -13520,33 +10640,31 @@ class Vic3ProvincePainter(tk.Toplevel):
         # Hidden by default otherwise
 
         # Status Bar
-        status_bar = tk.Frame(self, bg="#323232", height=25)
+        status_bar = tk.Frame(self, bg="#352b21", height=25)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
         self.status_var = tk.StringVar(value="Initializing...")
-        tk.Label(status_bar, textvariable=self.status_var, bg="#323232", fg="#B0BEC5").pack(side=tk.LEFT, padx=10)
+        tk.Label(status_bar, textvariable=self.status_var, bg="#352b21", fg="#B0BEC5").pack(side=tk.LEFT, padx=10)
 
         # Canvas Area
-        self.canvas_frame = tk.Frame(self, bg="#212121")
+        self.canvas_frame = tk.Frame(self, bg="#28231d")
         self.canvas_frame.pack(fill=tk.BOTH, expand=True)
 
         self.h_scroll = tk.Scrollbar(self.canvas_frame, orient=tk.HORIZONTAL)
         self.v_scroll = tk.Scrollbar(self.canvas_frame, orient=tk.VERTICAL)
 
         self.canvas = tk.Canvas(self.canvas_frame, bg="#101010", highlightthickness=0,
-                                xscrollcommand=self.h_scroll.set, yscrollcommand=self.v_scroll.set)
+                                xscrollcommand=lambda *v: self.scroll_changed(self.h_scroll, v), yscrollcommand=lambda *v: self.scroll_changed(self.v_scroll, v))
 
-        self.h_scroll.config(command=self.on_horizontal_scroll)
-        self.v_scroll.config(command=self.on_vertical_scroll)
+        self.h_scroll.config(command=self.canvas.xview)
+        self.v_scroll.config(command=self.canvas.yview)
 
         self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
         self.v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.canvas.bind("<Configure>", self.on_canvas_configure)
 
-        self.canvas.bind("<ButtonPress-1>", self.on_left_button_press)
-        self.canvas.bind("<B1-Motion>", self.on_left_button_drag)
-        self.canvas.bind("<ButtonRelease-1>", self.on_left_button_release)
+        self.canvas.bind("<Configure>", lambda e: self.queue_view())
+        self.canvas.bind("<Button-1>", self.on_click)
         self.canvas.bind("<Button-3>", self.on_right_click)
 
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
@@ -13554,110 +10672,26 @@ class Vic3ProvincePainter(tk.Toplevel):
         self.canvas.bind("<Button-5>", self.on_mousewheel)
         self.canvas.bind("<ButtonPress-2>", self.start_pan)
         self.canvas.bind("<B2-Motion>", self.do_pan)
-        self.canvas.bind("<ButtonRelease-2>", self.end_pan)
-
-    def on_left_button_press(self, event):
-        self._left_drag_start = self._get_canvas_event_point(event)
-        self._left_drag_active = False
-        self._clear_drag_box()
-        return "break"
-
-    def on_left_button_drag(self, event):
-        if self._left_drag_start is None or not self._supports_drag_box():
-            return "break"
-
-        curr_x, curr_y = self._get_canvas_event_point(event)
-        start_x, start_y = self._left_drag_start
-
-        if not self._left_drag_active:
-            moved_x = abs(curr_x - start_x)
-            moved_y = abs(curr_y - start_y)
-            if moved_x < self._left_drag_threshold and moved_y < self._left_drag_threshold:
-                return "break"
-            self._left_drag_active = True
-            self._left_drag_box_id = self.canvas.create_rectangle(
-                start_x,
-                start_y,
-                curr_x,
-                curr_y,
-                outline="#FFEE58" if self.impassable_mode else "#4FC3F7",
-                width=2,
-                dash=(6, 3)
-            )
-        else:
-            self.canvas.coords(self._left_drag_box_id, start_x, start_y, curr_x, curr_y)
-
-        return "break"
-
-    def on_left_button_release(self, event):
-        if self._left_drag_start is None:
-            return "break"
-
-        start_x, start_y = self._left_drag_start
-        end_x, end_y = self._get_canvas_event_point(event)
-        was_drag = self._left_drag_active
-
-        self._left_drag_start = None
-        self._left_drag_active = False
-        self._clear_drag_box()
-
-        if was_drag and self._supports_drag_box():
-            province_hexes = self._get_hexes_in_canvas_box(start_x, start_y, end_x, end_y)
-            if self.impassable_mode:
-                self._apply_impassable_box(province_hexes)
-            else:
-                self._apply_box_selection(province_hexes)
-            return "break"
-
-        return self.on_click(event)
 
     def start_pan(self, event):
-        self._is_panning = True
-        self.canvas.configure(cursor="fleur")
         self.canvas.scan_mark(event.x, event.y)
-        return "break"
 
     def do_pan(self, event):
-        if not self._is_panning:
-            return "break"
         self.canvas.scan_dragto(event.x, event.y, gain=1)
-        self._queue_viewport_refresh(0)
-        return "break"
-
-    def end_pan(self, event):
-        self._is_panning = False
-        self.canvas.configure(cursor="")
-        self._queue_viewport_refresh(0)
-        return "break"
-
-    def on_horizontal_scroll(self, *args):
-        self.canvas.xview(*args)
-        self._queue_viewport_refresh(0)
-
-    def on_vertical_scroll(self, *args):
-        self.canvas.yview(*args)
-        self._queue_viewport_refresh(0)
-
-    def on_canvas_configure(self, event):
-        self._queue_viewport_refresh(0)
 
     def on_mousewheel(self, event):
         num = getattr(event, 'num', None)
         delta = getattr(event, 'delta', 0)
-        anchor = self._capture_view_anchor(event)
         if num == 4 or delta > 0:
-            self.zoom_in(anchor=anchor)
+            self.zoom_in()
         elif num == 5 or delta < 0:
-            self.zoom_out(anchor=anchor)
-        return "break"
+            self.zoom_out()
 
     def start_loading(self, reload_image=True):
         self.status_var.set("Loading Data...")
-        self._load_request_id += 1
-        load_id = self._load_request_id
-        threading.Thread(target=self.load_data, args=(load_id, reload_image), daemon=True).start()
+        threading.Thread(target=self.load_data, args=(reload_image,), daemon=True).start()
 
-    def load_data(self, load_id, reload_image):
+    def load_data(self, reload_image):
         try:
             # Sync backend state manager first
             self.logic.state_manager.load_state_regions()
@@ -13668,10 +10702,6 @@ class Vic3ProvincePainter(tk.Toplevel):
             self.state_province_map = {}
             self.province_owner_map = {}
             self.pending_transfers = []
-            self._invalidate_base_render()
-            if reload_image:
-                self.original_map_image = None
-                self.original_rgb_array = None
 
             # 1. Colors
             self.country_colors = self.logic.scan_all_country_colors()
@@ -13681,68 +10711,28 @@ class Vic3ProvincePainter(tk.Toplevel):
 
             # 3. History (State+Hex -> Owner)
             self.parse_history_states()
-            self._refresh_selected_cache()
-            self._refresh_impassable_cache()
 
             # 4. Map Image (Only if needed)
-            if reload_image or self.original_rgb_array is None:
+            if reload_image or self.province_indices is None:
                 self.load_province_map()
 
             # 5. Render (Schedule on Main Thread)
-            self.after(0, lambda lid=load_id: self.finish_loading_success(lid))
+            self.after(0, self.finish_loading_success)
 
         except Exception as e:
-            self.after(0, lambda err=e, lid=load_id: self.finish_loading_error(lid, err))
+            self.after(0, lambda message=str(e): self.status_var.set(f"Error: {message}"))
             traceback.print_exc()
 
-    def finish_loading_error(self, load_id, error):
-        if load_id != self._load_request_id:
-            return
-        self.status_var.set(f"Error: {error}")
-
-    def finish_loading_success(self, load_id):
-        if load_id != self._load_request_id:
-            return
+    def finish_loading_success(self):
         self.refresh_map()
-        self._set_default_status()
+        if self.start_mode.startswith("PICK_"):
+            self.status_var.set("Middle-drag to pan. Scroll to zoom.")
+            return
+        self.status_var.set("Click the capital, then click additional states. Middle-drag to pan." if self.start_mode == "COUNTRY" else "Ready. Left Click to Paint, Right Click to Pick.")
 
     def parse_state_regions(self):
-        # Load vanilla first, then modded state regions so mod files override.
-        paths = []
-        if self.logic.vanilla_path:
-            paths.append(os.path.join(self.logic.vanilla_path, "game/map/data/state_regions"))
-        if self.logic.mod_path:
-            paths.append(os.path.join(self.logic.mod_path, "map/data/state_regions"))
-            paths.append(os.path.join(self.logic.mod_path, "map_data/state_regions"))
-
-        for p in paths:
-            if not os.path.exists(p): continue
-            for root, _, files in os.walk(p):
-                for file in files:
-                    if not file.endswith(".txt"): continue
-                    with open(os.path.join(root, file), 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-
-                    # Parse STATE_NAME = { ... provinces = { "xHEX" ... } ... }
-                    cursor = 0
-                    while True:
-                        m = re.search(r"(STATE_[A-Za-z0-9_]+)\s*=\s*\{", content[cursor:])
-                        if not m: break
-                        state_name = m.group(1)
-                        s_idx, e_idx = self.logic.find_block_content(content, cursor + m.end() - 1)
-                        if s_idx:
-                            block = content[s_idx:e_idx]
-                            p_match = re.search(r"provinces\s*=\s*\{", block)
-                            if p_match:
-                                ps, pe = self.logic.find_block_content(block, p_match.end() - 1)
-                                if ps:
-                                    provs = [p.lower() for p in block[ps+1:pe-1].replace('"', '').split()]
-                                    self.state_province_map[state_name] = provs
-                                    for hex_code in provs:
-                                        self.province_to_state[hex_code] = state_name
-                            cursor = e_idx
-                        else:
-                            cursor += 1
+        self.province_to_state=dict(self.logic.state_manager.province_owner_map)
+        self.state_province_map={key:list(obj.provinces) for key,obj in self.logic.state_manager.states.items()}
 
     def parse_history_states(self):
         # Scan common/history/states
@@ -13776,12 +10766,12 @@ class Vic3ProvincePainter(tk.Toplevel):
                     # s:STATE = { create_state = { country = c:TAG owned_provinces = { ... } } }
                     cursor = 0
                     while True:
-                        m = re.search(r"s:(STATE_[A-Za-z0-9_]+)\s*(?:\?=|=)\s*\{", content[cursor:])
+                        m = re.search(r"s:(STATE_[A-Za-z0-9_]+)\s*=\s*\{", content[cursor:])
                         if not m: break
                         state_name = m.group(1)
                         s_idx, e_idx = self.logic.find_block_content(content, cursor + m.end() - 1)
 
-                        if s_idx:
+                        if s_idx is not None:
                             block = content[s_idx:e_idx]
                             # Find all create_state
                             cs_cursor = 0
@@ -13827,232 +10817,182 @@ class Vic3ProvincePainter(tk.Toplevel):
                             cursor += 1
 
     def load_province_map(self):
-        if self.original_rgb_array is None:
+        # Load cached or from disk
+        if self.original_map_image is None:
+            # Try mod then vanilla
             candidates = []
             if self.logic.mod_path:
                 candidates.append(os.path.join(self.logic.mod_path, "map/data/provinces.png"))
                 candidates.append(os.path.join(self.logic.mod_path, "map_data/provinces.png"))
-            if self.logic.vanilla_path:
-                candidates.append(os.path.join(self.logic.vanilla_path, "game/map/data/provinces.png"))
+            if self.logic.vanilla_path: candidates.append(os.path.join(self.logic.vanilla_path, "game/map_data/provinces.png"))
 
             path = next((x for x in candidates if os.path.exists(x)), None)
             if not path:
                 raise FileNotFoundError("provinces.png not found")
 
             self.original_map_image = Image.open(path).convert("RGB")
-            self.original_map_image.load()
-            self.original_rgb_array = np.ascontiguousarray(np.array(self.original_map_image, dtype=np.uint8))
-            self.source_height, self.source_width = self.original_rgb_array.shape[:2]
-            self._clear_scaled_map_cache()
+            self.original_map_image.load() # Ensure loaded
 
-        self._update_virtual_map_size()
+        self.map_width, self.map_height = self.original_map_image.size
+        self.province_indices = True  # Image loaded; hit testing reads the source pixel.
 
-    def zoom_in(self, anchor=None):
-        self._queue_zoom(self.scale_factor + 0.1, anchor=anchor)
+    def update_country_summary(self):
+        form = self.parent
+        self.country_summary.configure(text=f"Donor: {form.cr_old_owner.get() or '—'}    Capital: {form.cr_capital.get() or '—'}    Additional states: {form.cr_others.get('1.0','end').strip() or '—'}")
 
-    def zoom_out(self, anchor=None):
-        self._queue_zoom(self.scale_factor - 0.1, anchor=anchor)
+    def pick_country_state(self, state, owner):
+        if not state or not owner or owner == 'None':
+            return
+        form = self.parent
+        form.cr_annex.set(False)
+        form.cr_annex_button.grid_remove()
+        form.toggle_annex_ui()
+        if self.pick_mode.get() == 'Capital':
+            form.cr_old_owner.set(owner)
+        others = form.cr_others.get('1.0', 'end').split()
+        if self.pick_mode.get() == 'Capital':
+            previous = form.cr_capital.get()
+            if previous and previous != state and previous not in others:
+                others.append(previous)
+            form.cr_capital.set(state)
+            self.pick_mode.set('States')
+        elif state != form.cr_capital.get():
+            if state in others and form.country_state_owners.get(state) == owner:
+                others.remove(state)
+            else:
+                if state not in others: others.append(state)
+        if state == form.cr_capital.get() or state in others:
+            if state != form.cr_capital.get() or owner == form.cr_old_owner.get():
+                form.country_state_owners[state] = owner
+        else:
+            form.country_state_owners.pop(state,None)
+        form.cr_others.delete('1.0', 'end')
+        form.cr_others.insert('1.0', ' '.join(k for k in others if k != form.cr_capital.get()))
+        self.update_country_summary()
+        self.refresh_map()
 
-    def get_owner_display_color(self, owner):
-        """Returns the real country color when available, otherwise a stable fallback."""
-        if not owner:
-            return None
+    def scroll_changed(self, scrollbar, values):
+        scrollbar.set(*values)
+        self.queue_view()
 
-        clean_owner = owner.replace("c:", "").strip().upper()
-        if clean_owner in self.country_colors:
-            return self.country_colors[clean_owner]
+    def queue_view(self):
+        if self.original_map_image is not None and not getattr(self, '_draw_pending', False):
+            self._draw_pending = True
+            self.after_idle(self.draw_view)
 
-        # Lazy exact lookup covers cases where the bulk scan missed a tag or when
-        # the user only configured a mod path and we need to auto-detect vanilla.
-        exact = self.logic.find_country_color(clean_owner)
-        if exact is not None:
-            self.country_colors[clean_owner] = exact
-            return exact
+    def zoom_in(self):
+        self.zoom_by(1.25)
 
-        # Deterministic fallback color so the political map stays readable even if
-        # a tag color still cannot be resolved.
-        seed = sum((i + 1) * ord(ch) for i, ch in enumerate(clean_owner))
-        hue = (seed % 360) / 360.0
-        sat = 0.58
-        val = 0.82
-        r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
-        return (int(r * 255), int(g * 255), int(b * 255))
+    def zoom_out(self):
+        self.zoom_by(0.8)
 
-    def _hex_to_packed_rgb(self, hex_code):
-        clean = str(hex_code).strip().lower()
-        if clean.startswith("x"):
-            clean = clean[1:]
-        if len(clean) != 6:
-            raise ValueError(f"Invalid province hex code: {hex_code}")
-        return int(clean, 16)
+    def zoom_by(self, factor):
+        if not self.map_width:
+            return
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        old = self.scale_factor
+        cx = (self.canvas.canvasx(0) + w/2) / old
+        cy = (self.canvas.canvasy(0) + h/2) / old
+        self.scale_factor = max(0.05, min(2.0, old * factor))
+        width, height = self.update_extent()
+        self.canvas.xview_moveto((cx*self.scale_factor-w/2)/width)
+        self.canvas.yview_moveto((cy*self.scale_factor-h/2)/height)
+        self.queue_view()
 
-    def _get_selected_fill_color(self, hex_code, fallback_rgb):
-        owner = self.province_owner_map.get(hex_code)
-        base_color = self.get_owner_display_color(owner) if owner else fallback_rgb
-        if base_color is None:
-            base_color = fallback_rgb
-
-        # Keep the owner tint visible while still making the selection pop.
-        return tuple((channel * 6 + 255 * 4) // 10 for channel in base_color)
-
-    def _expand_mask(self, mask, iterations=1):
-        expanded = mask.copy()
-        for _ in range(iterations):
-            grown = expanded.copy()
-            grown[:, 1:] |= expanded[:, :-1]
-            grown[:, :-1] |= expanded[:, 1:]
-            grown[1:, :] |= expanded[:-1, :]
-            grown[:-1, :] |= expanded[1:, :]
-            expanded = grown
-        return expanded
-
-    def _get_selected_outline_mask(self, selected_mask, label_slice):
-        outline_mask = np.zeros_like(selected_mask, dtype=bool)
-        if not np.any(selected_mask):
-            return outline_mask
-
-        horizontal_diff = label_slice[:, 1:] != label_slice[:, :-1]
-        vertical_diff = label_slice[1:, :] != label_slice[:-1, :]
-
-        outline_mask[:, 1:] |= selected_mask[:, 1:] & horizontal_diff
-        outline_mask[:, :-1] |= selected_mask[:, :-1] & horizontal_diff
-        outline_mask[1:, :] |= selected_mask[1:, :] & vertical_diff
-        outline_mask[:-1, :] |= selected_mask[:-1, :] & vertical_diff
-
-        if self.scale_factor >= 1.0:
-            outline_mask = self._expand_mask(outline_mask, 1)
-
-        return outline_mask
+    def update_extent(self):
+        width = max(1, round(self.map_width*self.scale_factor))
+        height = max(1, round(self.map_height*self.scale_factor))
+        self.canvas.configure(scrollregion=(0,0,width,height))
+        return width, height
 
     def refresh_map(self):
-        if self.original_rgb_array is None:
+        if not self.map_width:
             return
+        # Rebuild the province palette only after data or selections change.
+        if not hasattr(self, '_palette'):
+            self._palette = np.empty((1 << 24, 3), dtype=np.uint8)
+        if self.view_mode == 'POLITICAL':
+            self._palette[:] = 50
+            for province, owner in self.province_owner_map.items():
+                if not re.fullmatch(r"x[0-9a-fA-F]{6}", province): continue
+                self._palette[int(province[1:],16)] = self.country_colors.get(owner,(150,150,150))
+            if self.start_mode == 'COUNTRY':
+                form = self.parent
+                for state in form.cr_others.get('1.0','end').split()+[form.cr_capital.get()]:
+                    for province in self.state_province_map.get(state, ()):
+                        if self.province_owner_map.get(province) == form.country_state_owners.get(state, form.cr_old_owner.get()):
+                            self._palette[int(province[1:],16)] = form.cr_rgb
+        self.update_extent()
+        self.queue_view()
 
-        viewport = self._get_visible_viewport()
-        if viewport is None:
+    def draw_view(self):
+        self._draw_pending = False
+        if not self.map_width or not hasattr(self, '_palette'):
             return
-
-        final_img = viewport["image"]
-        view_packed = viewport.get("packed")
-        render_width = viewport.get("render_width", 0)
-        render_height = viewport.get("render_height", 0)
-        visible_region = final_img[:render_height, :render_width]
-        selected_values = self.selected_packed_values if not self.impassable_mode else np.array([], dtype=np.int32)
-        impassable_values = self.impassable_packed_values if self.impassable_mode else np.array([], dtype=np.int32)
-        outline_color = np.array([18, 18, 18], dtype=np.uint8)
-        impassable_color = np.array([160, 48, 48], dtype=np.uint8)
-        impassable_outline_color = np.array([64, 12, 12], dtype=np.uint8)
-
-        if view_packed is not None and render_width > 0 and render_height > 0:
-            unique_values = None
-            inverse_map = None
-
-            if self.view_mode == "POLITICAL":
-                unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
-                inverse_map = inverse.reshape(render_height, render_width)
-                palette = np.full((len(unique_values), 3), 50, dtype=np.uint8)
-
-                for idx, packed in enumerate(unique_values):
-                    owner = self.province_owner_map.get(self._packed_to_hex(packed))
-                    if owner:
-                        palette[idx] = self.get_owner_display_color(owner) or (50, 50, 50)
-
-                visible_region[:, :] = palette[inverse_map]
-
-            if impassable_values.size > 0:
-                if unique_values is None or inverse_map is None:
-                    unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
-                    inverse_map = inverse.reshape(render_height, render_width)
-
-                impassable_unique_mask = np.isin(unique_values, impassable_values)
-                if np.any(impassable_unique_mask):
-                    impassable_mask = impassable_unique_mask[inverse_map]
-                    impassable_pixels = visible_region[impassable_mask].astype(np.uint16)
-                    visible_region[impassable_mask] = ((impassable_pixels * 6) + (impassable_color * 4)) // 10
-
-                    impassable_outline_mask = self._get_selected_outline_mask(impassable_mask, view_packed)
-                    if np.any(impassable_outline_mask):
-                        visible_region[impassable_outline_mask] = impassable_outline_color
-
-            if selected_values.size > 0:
-                if unique_values is None or inverse_map is None:
-                    unique_values, inverse = np.unique(view_packed.reshape(-1), return_inverse=True)
-                    inverse_map = inverse.reshape(render_height, render_width)
-
-                selected_unique_mask = np.isin(unique_values, selected_values)
-                if np.any(selected_unique_mask):
-                    selected_mask = selected_unique_mask[inverse_map]
-
-                    if self.view_mode == "PROVINCE":
-                        highlight_palette = np.zeros((len(unique_values), 3), dtype=np.uint8)
-                        selected_indices = np.flatnonzero(selected_unique_mask)
-                        for idx in selected_indices:
-                            packed = int(unique_values[idx])
-                            highlight_palette[idx] = self.selected_fill_colors.get(
-                                packed,
-                                (
-                                    (packed >> 16) & 0xFF,
-                                    (packed >> 8) & 0xFF,
-                                    packed & 0xFF,
-                                ),
-                            )
-                        visible_region[selected_mask] = highlight_palette[inverse_map][selected_mask]
-                    else:
-                        selected_pixels = visible_region[selected_mask].astype(np.uint16)
-                        visible_region[selected_mask] = ((selected_pixels * 7) + (255 * 3)) // 10
-
-                    outline_mask = self._get_selected_outline_mask(selected_mask, view_packed)
-                    if np.any(outline_mask):
-                        visible_region[outline_mask] = outline_color
-
-        pil_img = Image.fromarray(final_img)
-        self.display_image = ImageTk.PhotoImage(pil_img)
-
-        self.canvas.config(scrollregion=(0, 0, self.map_width, self.map_height))
-        if self.canvas_image_id is None:
-            self.canvas_image_id = self.canvas.create_image(
-                viewport["view_left"],
-                viewport["view_top"],
-                image=self.display_image,
-                anchor="nw",
-            )
+        scale = self.scale_factor
+        x = max(0,int(self.canvas.canvasx(0)))
+        y = max(0,int(self.canvas.canvasy(0)))
+        w = min(self.canvas.winfo_width()+1, int(self.map_width*scale)-x)
+        h = min(self.canvas.winfo_height()+1, int(self.map_height*scale)-y)
+        if min(w,h) <= 0:
+            return
+        box = (x/scale,y/scale,min(self.map_width,(x+w)/scale),min(self.map_height,(y+h)/scale))
+        tile = self.original_map_image.resize((w,h),Image.Resampling.NEAREST,box=box)
+        if self.view_mode == 'POLITICAL' or self.selected_provinces:
+            arr = np.asarray(tile,dtype=np.uint32)
+            keys = (arr[:,:,0]<<16) | (arr[:,:,1]<<8) | arr[:,:,2]
+            if self.view_mode == 'POLITICAL':
+                pixels = self._palette[keys]
+                if self.start_mode == 'COUNTRY':
+                    form = self.parent
+                    capital = [int(h[1:],16) for h in self.state_province_map.get(form.cr_capital.get(),())
+                               if self.province_owner_map.get(h) == form.cr_old_owner.get()]
+                    if capital:
+                        mask = np.isin(keys,capital)
+                        edge = np.zeros_like(mask)
+                        edge[1:] |= mask[1:] != mask[:-1]
+                        edge[:,1:] |= mask[:,1:] != mask[:,:-1]
+                        rows, cols = np.ogrid[y:y+h,x:x+w]
+                        pixels[edge & (((rows+cols)//3)%2 == 0)] = (255,205,78)
+                tile = Image.fromarray(pixels)
+            else:
+                pixels = np.array(tile)
+                pixels[np.isin(keys,[int(p[1:],16) for p in self.selected_provinces])] = 255
+                tile = Image.fromarray(pixels)
+        self.display_image = ImageTk.PhotoImage(tile)
+        if hasattr(self, '_tile_id'):
+            self.canvas.coords(self._tile_id,x,y)
+            self.canvas.itemconfigure(self._tile_id,image=self.display_image)
         else:
-            self.canvas.itemconfig(self.canvas_image_id, image=self.display_image)
-            self.canvas.coords(self.canvas_image_id, viewport["view_left"], viewport["view_top"])
+            self._tile_id = self.canvas.create_image(x,y,image=self.display_image,anchor="nw")
 
     def on_click(self, event):
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
 
-        ix, iy = int(x), int(y)
-        hex_code = self._get_hex_at_canvas_pixel(ix, iy)
-        if not hex_code:
-            return
+        ix, iy = int(x/self.scale_factor), int(y/self.scale_factor)
+        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height: return
 
-        if self.pending_state_creation and self.pending_hub_step:
-            self._handle_hub_selection_click(hex_code)
-            return
-
-        if self.impassable_mode:
-            result = self.logic.state_manager.toggle_province_impassable(hex_code)
-            if not result:
-                self.status_var.set(f"Could not resolve an owning state for {hex_code}.")
-                return
-
-            owner_state, is_impassable, affected_states = result
-            self._refresh_impassable_cache()
-            self.refresh_map()
-            if is_impassable:
-                self.status_var.set(f"Marked {hex_code} impassable in {owner_state}.")
-            else:
-                self.status_var.set(f"Removed {hex_code} from impassable in {owner_state}.")
-            if len(affected_states) > 1:
-                self.logic.log(f"[MAP] Cleaned stale impassable references for {hex_code} in {len(affected_states)} state files.")
-            return
+        # Identify Province from packed index
+        r, g, b = self.original_map_image.getpixel((ix, iy))
+        hex_code = "x{:02X}{:02X}{:02X}".format(r, g, b).lower()
 
         state = self.province_to_state.get(hex_code)
         owner = self.province_owner_map.get(hex_code, "None")
 
+        if self.start_mode.startswith("PICK_"):
+            country = self.start_mode == "PICK_COUNTRY"
+            value = owner if country else state
+            if not value or value == "None" or not owner or owner == "None":
+                self.status_var.set("Choose a land province with an owner.")
+                return
+            callback = self.on_pick
+            self.destroy()
+            callback(owner, state)
+            return
+        if self.start_mode == "COUNTRY":
+            self.pick_country_state(state, owner)
+            return
         if self.view_mode == "PROVINCE" or self.start_mode == "CUSTOM_STATE":
             # Toggle Selection
             if hex_code in self.selected_provinces:
@@ -14061,7 +11001,6 @@ class Vic3ProvincePainter(tk.Toplevel):
             else:
                 self.selected_provinces.add(hex_code)
                 self.status_var.set(f"Selected {hex_code}")
-            self._refresh_selected_cache()
             self.refresh_map()
         else:
             # Political Paint Mode
@@ -14079,26 +11018,20 @@ class Vic3ProvincePainter(tk.Toplevel):
                         if self.province_owner_map.get(h) == owner:
                             self.province_owner_map[h] = new_tag
 
-                self._invalidate_base_render()
                 self.refresh_map()
                 self.status_var.set(f"Painted {state} ({owner} -> {new_tag})")
             else:
                 self.status_var.set(f"Province: {hex_code} | State: {state} | Owner: {owner}")
 
     def on_right_click(self, event):
-        if self.pending_state_creation and self.pending_hub_step:
-            self._set_default_status()
-            return
-        if self.impassable_mode:
-            self._set_default_status()
-            return
-
+        if self.start_mode == "COUNTRY" or self.start_mode.startswith("PICK_"): return
         x = self.canvas.canvasx(event.x)
         y = self.canvas.canvasy(event.y)
-        ix, iy = int(x), int(y)
-        hex_code = self._get_hex_at_canvas_pixel(ix, iy)
-        if not hex_code:
-            return
+        ix, iy = int(x/self.scale_factor), int(y/self.scale_factor)
+        if ix < 0 or ix >= self.map_width or iy < 0 or iy >= self.map_height: return
+
+        r, g, b = self.original_map_image.getpixel((ix, iy))
+        hex_code = "x{:02X}{:02X}{:02X}".format(r, g, b).lower()
 
         owner = self.province_owner_map.get(hex_code)
 
@@ -14111,7 +11044,6 @@ class Vic3ProvincePainter(tk.Toplevel):
                     self.target_state_var.set("None")
                     self.status_var.set("Target State Deselected")
                     self.selected_provinces.clear()
-                    self._refresh_selected_cache()
                     self.refresh_map()
                 else:
                     self.custom_target_state = state
@@ -14123,7 +11055,6 @@ class Vic3ProvincePainter(tk.Toplevel):
                         self.selected_provinces.clear()
                         for p in self.state_province_map[state]:
                             self.selected_provinces.add(p)
-                        self._refresh_selected_cache()
                         self.refresh_map()
         else:
             if owner and owner != "None":
@@ -14142,6 +11073,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                 return True
         return False
 
+    @mod_operation
     def execute_changes(self):
         if not self.pending_transfers:
             return messagebox.showinfo("Info", "No pending changes.")
@@ -14231,14 +11163,13 @@ class Vic3ProvincePainter(tk.Toplevel):
     def toggle_view_mode(self):
         if self.view_mode == "POLITICAL":
             self.view_mode = "PROVINCE"
-            self.btn_prov_mode.config(text="Political Mode", bg="#00ACC1")
+            self.btn_prov_mode.config(text="Political Mode", bg="#e6bc74")
             self.btn_export.pack(side=tk.LEFT, padx=10)
         else:
             self.view_mode = "POLITICAL"
-            self.btn_prov_mode.config(text="Province Selector", bg="#424242")
+            self.btn_prov_mode.config(text="Province Selector", bg="#473a2b")
             self.btn_export.pack_forget()
         self.refresh_map()
-        self._set_default_status()
 
     def export_selected_provinces(self):
         if not self.selected_provinces:
@@ -14260,24 +11191,11 @@ class Vic3ProvincePainter(tk.Toplevel):
         txt.focus_set()
 
     def clear_selection(self):
-        if self.pending_state_creation:
-            if not messagebox.askyesno("Cancel State Creation", "Cancel the pending state creation and clear the current selection?"):
-                return
-            self.pending_state_creation = None
-            self.pending_hub_step = None
         self.selected_provinces.clear()
-        self._refresh_selected_cache()
         self.refresh_map()
-        self._set_default_status()
 
+    @mod_operation
     def modify_state_action(self):
-        if self.pending_state_creation:
-            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
-            return
-        if self.impassable_mode:
-            messagebox.showerror("Error", "Exit impassable mode before transferring provinces.")
-            return
-
         if not self.custom_target_state:
             messagebox.showerror("Error", "No Target State selected (Right-Click a state).")
             return
@@ -14458,53 +11376,11 @@ class Vic3ProvincePainter(tk.Toplevel):
                             self.logic.state_manager.move_orphaned_region_state(old_state_id, tag, self.custom_target_state)
 
             self.selected_provinces.clear()
-            self._refresh_selected_cache()
             self.reload_data()
             messagebox.showinfo("Success", "Transferred provinces.")
 
-    def toggle_impassable_mode(self):
-        if self.pending_state_creation:
-            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
-            return
-
-        self.impassable_mode = not self.impassable_mode
-        if self.start_mode == "CUSTOM_STATE":
-            if self.impassable_mode:
-                self.btn_impassable_mode.config(text="Exit Impassable Mode", bg="#C62828")
-            else:
-                self.btn_impassable_mode.config(text="Make Impassable", bg="#8E24AA")
-        self._set_default_status()
-        self.refresh_map()
-
-    def prompt_new_state_numeric_id(self):
-        default_id = self.logic.state_manager.get_next_state_numeric_id()
-        used_ids = set(self.logic.state_manager.get_existing_state_numeric_ids())
-
-        while True:
-            numeric_id = simpledialog.askinteger(
-                "Create State",
-                "Enter State ID:",
-                initialvalue=default_id,
-                minvalue=1
-            )
-            if numeric_id is None:
-                return None
-            if numeric_id in used_ids:
-                messagebox.showerror("Error", f"State ID {numeric_id} is already in use.")
-                default_id = numeric_id + 1
-                while default_id in used_ids:
-                    default_id += 1
-                continue
-            return numeric_id
-
+    @mod_operation
     def create_new_state_action(self):
-        if self.pending_state_creation:
-            messagebox.showerror("Error", "Finish the current hub selection or clear the selection to cancel it first.")
-            return
-        if self.impassable_mode:
-            messagebox.showerror("Error", "Exit impassable mode before creating a new state.")
-            return
-
         if not self.selected_provinces:
             messagebox.showerror("Error", "No provinces selected.")
             return
@@ -14530,8 +11406,6 @@ class Vic3ProvincePainter(tk.Toplevel):
         name = simpledialog.askstring("Create State", "Enter State Name (e.g. Texas):")
         if not name: return
 
-        owner_data = None
-
         if split_strategy == "single":
             if target_owner:
                 owner = target_owner
@@ -14540,7 +11414,7 @@ class Vic3ProvincePainter(tk.Toplevel):
                 if not owner: return
 
             clean_owner = self.logic.format_tag_clean(owner)
-            owner_data = clean_owner
+            self.logic.state_manager.create_new_state(name, clean_owner, list(self.selected_provinces))
 
         else: # split
             # Build dict {tag: [provs]}
@@ -14562,22 +11436,29 @@ class Vic3ProvincePainter(tk.Toplevel):
                          first = list(found_owners)[0]
                          owner_data[first].append(p)
 
-        numeric_id = self.prompt_new_state_numeric_id()
-        if numeric_id is None:
-            return
-
-        if messagebox.askyesno("Create State", "Would you like to specify hub provinces manually?"):
-            self._begin_hub_selection(name, owner_data, numeric_id)
-            return
-
-        self.logic.state_manager.create_new_state(name, owner_data, list(self.selected_provinces), numeric_id)
-        self._prompt_state_localization_names(self.logic.normalize_state_key(name), name)
+            self.logic.state_manager.create_new_state(name, owner_data, list(self.selected_provinces))
 
         self.selected_provinces.clear()
-        self._refresh_selected_cache()
         self.reload_data()
         messagebox.showinfo("Success", f"Created state {name}.")
 
-if __name__ == "__main__":
-    app = App()
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Victoria 3 Modding Studio')
+    parser.add_argument('--version',action='version',version=APP_VERSION)
+    parser.add_argument('--validate',metavar='MOD',help='Validate a mod and print JSON instead of opening the GUI')
+    parser.add_argument('--game',metavar='INSTALL',help='Victoria 3 installation or game folder for validation')
+    args=parser.parse_args()
+    if args.validate:
+        logic=Vic3Logic(lambda *args:None)
+        if args.game:logic.set_vanilla_path(args.game)
+        logic.set_mod_path(args.validate)
+        issues=logic.validate_mod()
+        print(json.dumps(issues,indent=2,ensure_ascii=False))
+        return int(any(issue['level']=='error' for issue in issues))
+    app=App()
     app.mainloop()
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())
